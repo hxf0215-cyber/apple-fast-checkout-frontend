@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
@@ -388,26 +388,30 @@ function exportReport() {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
-  const [stateResult, modelList, storeList] = await Promise.all([
-    api.state(),
-    api.models(),
-    api.stores()
-  ]);
-  state.value = stateResult;
-  models.value = modelList || [];
-  stores.value = storeList || [];
-  selectedAccountId.value = stateResult.accounts[0]?.id || "";
-  manualForm.accountId = selectedAccountId.value;
-  wechatForm.accountId = selectedAccountId.value;
-  manualForm.part =
-    stateResult.accounts[0]?.parts?.[0] || modelList?.[0]?.part || "";
-  wechatForm.part = manualForm.part;
-  await loadWechatDetail(true);
-  fillSettings();
-  pollTimer = setInterval(async () => {
-    await load();
+  try {
+    const [stateResult, modelList, storeList] = await Promise.all([
+      api.state(),
+      api.models(),
+      api.stores()
+    ]);
+    state.value = stateResult;
+    models.value = modelList || [];
+    stores.value = storeList || [];
+    selectedAccountId.value = stateResult.accounts[0]?.id || "";
+    manualForm.accountId = selectedAccountId.value;
+    wechatForm.accountId = selectedAccountId.value;
+    manualForm.part =
+      stateResult.accounts[0]?.parts?.[0] || modelList?.[0]?.part || "";
+    wechatForm.part = manualForm.part;
+    await loadWechatDetail(true);
     fillSettings();
-  }, 2000);
+    pollTimer = setInterval(async () => {
+      await load();
+      fillSettings();
+    }, 2000);
+  } catch (error: any) {
+    console.error("monitor init failed:", error);
+  }
 });
 
 watch(selectedAccountId, id => {

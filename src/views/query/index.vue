@@ -52,16 +52,20 @@ async function queryStock() {
 }
 
 onMounted(async () => {
-  const [state, modelList, storeList] = await Promise.all([
-    api.state(),
-    api.models(),
-    api.stores()
-  ]);
-  accounts.value = state.accounts || [];
-  models.value = modelList || [];
-  stores.value = storeList || [];
-  accountId.value = accounts.value[0]?.id || "";
-  part.value = models.value[0]?.part || "";
+  try {
+    const [state, modelList, storeList] = await Promise.all([
+      api.state(),
+      api.models(),
+      api.stores()
+    ]);
+    accounts.value = state.accounts || [];
+    models.value = modelList || [];
+    stores.value = storeList || [];
+    accountId.value = accounts.value[0]?.id || "";
+    part.value = models.value[0]?.part || "";
+  } catch (error: any) {
+    console.error("query init failed:", error);
+  }
 });
 </script>
 

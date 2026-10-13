@@ -160,16 +160,20 @@ async function load() {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(async () => {
-  const [state, modelList, storeList] = await Promise.all([
-    api.state(),
-    api.models(),
-    api.stores()
-  ]);
-  accounts.value = state.accounts || [];
-  orders.value = state.orders || [];
-  models.value = modelList || [];
-  stores.value = storeList || [];
-  pollTimer = setInterval(load, 1500);
+  try {
+    const [state, modelList, storeList] = await Promise.all([
+      api.state(),
+      api.models(),
+      api.stores()
+    ]);
+    accounts.value = state.accounts || [];
+    orders.value = state.orders || [];
+    models.value = modelList || [];
+    stores.value = storeList || [];
+    pollTimer = setInterval(load, 1500);
+  } catch (error: any) {
+    console.error("overview init failed:", error);
+  }
 });
 
 watch(orderKeyword, () => {

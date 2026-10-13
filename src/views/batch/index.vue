@@ -98,11 +98,15 @@ async function importCookies(start = false) {
 }
 
 onMounted(async () => {
-  models.value = (await api.models()) || [];
-  stores.value = (await api.stores()) || [];
-  const chongqing = stores.value.find(store => store.store_id === "R480");
-  if (chongqing) form.stores = [chongqing.store_id];
-  if (models.value.length) form.parts = [models.value[0].part];
+  try {
+    models.value = (await api.models()) || [];
+    stores.value = (await api.stores()) || [];
+    const chongqing = stores.value.find(store => store.store_id === "R480");
+    if (chongqing) form.stores = [chongqing.store_id];
+    if (models.value.length) form.parts = [models.value[0].part];
+  } catch (error: any) {
+    console.error("batch init failed:", error);
+  }
 });
 </script>
 
