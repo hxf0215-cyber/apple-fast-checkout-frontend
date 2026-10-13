@@ -3,10 +3,10 @@ import router from "./router";
 import { setupStore } from "@/store";
 import { getPlatformConfig } from "./config";
 import { MotionPlugin } from "@vueuse/motion";
-// import { useEcharts } from "@/plugins/echarts";
 import { createApp, type Directive } from "vue";
 import { useElementPlus } from "@/plugins/elementPlus";
 import { injectResponsiveStorage } from "@/utils/responsive";
+import VueTippy from "vue-tippy";
 
 import Table from "@pureadmin/table";
 // import PureDescriptions from "@pureadmin/descriptions";
@@ -45,19 +45,19 @@ import { Perms } from "@/components/RePerms";
 app.component("Auth", Auth);
 app.component("Perms", Perms);
 
-// 全局注册vue-tippy
-import "tippy.js/dist/tippy.css";
-import "tippy.js/themes/light.css";
-import VueTippy from "vue-tippy";
-app.use(VueTippy);
 
 getPlatformConfig(app).then(async config => {
   setupStore(app);
   app.use(router);
   await router.isReady();
   injectResponsiveStorage(app, config);
-  app.use(MotionPlugin).use(useElementPlus).use(Table);
+  app.use(MotionPlugin).use(VueTippy).use(useElementPlus).use(Table);
   // .use(PureDescriptions)
-  // .use(useEcharts);
   app.mount("#app");
 });
+
+
+
+
+
+

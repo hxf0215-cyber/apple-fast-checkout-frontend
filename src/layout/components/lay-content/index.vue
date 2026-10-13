@@ -88,10 +88,10 @@ const transitionMain = defineComponent({
       {
         name: enterTransition ? "pure-classes-transition" : transitionName,
         enterActiveClass: enterTransition
-          ? `animate__animated ${enterTransition}`
+          ? `fade-slide ${enterTransition}`
           : undefined,
         leaveActiveClass: leaveTransition
-          ? `animate__animated ${leaveTransition}`
+          ? `fade-slide ${leaveTransition}`
           : undefined,
         mode: "out-in",
         appear: true
@@ -205,4 +205,11 @@ const transitionMain = defineComponent({
 .main-content {
   margin: 24px;
 }
+</style>
+
+<style>
+.fade-slide-enter-active { transition: opacity 0.2s ease, transform 0.2s ease; }
+.fade-slide-leave-active { transition: opacity 0.15s ease, transform 0.15s ease; }
+.fade-slide-enter-from { opacity: 0; transform: translateY(8px); }
+.fade-slide-leave-to { opacity: 0; transform: translateY(-8px); }
 </style>

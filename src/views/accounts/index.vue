@@ -139,7 +139,8 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
-      <el-table
+      <el-skeleton v-if="loading && !accounts.length" :rows="5" animated style="padding: 20px" />
+      <el-table v-else
         v-loading="loading"
         :data="filteredAccounts"
         height="100%"
@@ -248,3 +249,5 @@ onUnmounted(() => {
   margin-top: 12px;
 }
 </style>
+
+

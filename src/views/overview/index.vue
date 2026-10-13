@@ -241,6 +241,7 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
+      <el-skeleton v-if="loading && !accounts.length" :rows="5" animated style="padding:20px" />
       <el-table v-loading="loading" :data="filteredAccounts" height="100%">
         <el-table-column
           prop="username"
@@ -438,3 +439,5 @@ onUnmounted(() => {
   align-items: center;
 }
 </style>
+
+

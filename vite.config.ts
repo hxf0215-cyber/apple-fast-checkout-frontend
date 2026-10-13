@@ -56,6 +56,10 @@ export default ({ mode }: ConfigEnv): UserConfigExport => {
         },
         // 静态资源分类打包
         output: {
+          manualChunks: {
+            "vendor-vue": ["vue", "vue-router", "pinia"],
+            "vendor-element": ["element-plus"],
+          },
           chunkFileNames: "static/js/[name]-[hash].js",
           entryFileNames: "static/js/[name]-[hash].js",
           assetFileNames: "static/[ext]/[name]-[hash].[ext]"
@@ -68,3 +72,4 @@ export default ({ mode }: ConfigEnv): UserConfigExport => {
     }
   };
 };
+
