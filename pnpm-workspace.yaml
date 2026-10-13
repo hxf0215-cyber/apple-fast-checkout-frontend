@@ -1,0 +1,14 @@
+onlyBuiltDependencies:
+  - "@parcel/watcher"
+  - core-js
+  - es5-ext
+  - esbuild
+  - typeit
+  - vue-demi
+  - husky
+ignoredBuiltDependencies:
+  - "@tailwindcss/oxide"
+allowBuilds:
+  '@parcel/watcher': set this to true or false
+  esbuild: set this to true or false
+  vue-demi: set this to true or false
