@@ -211,6 +211,11 @@ export const api = {
       `/api/accounts/${encodeURIComponent(id)}/wechat-prepare`,
       { data }
     ),
+  warmupBatch: (data: { account_ids?: string[] }) =>
+    http.post<null, { ok: boolean; accounts?: number; error?: string }>(
+      "/api/wechat/warmup-batch",
+      { data }
+    ),
   wechatPrepareBatch: (data: { account_ids: string[]; part?: string }) =>
     http.post<
       null,

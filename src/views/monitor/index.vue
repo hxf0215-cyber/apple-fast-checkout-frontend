@@ -315,6 +315,22 @@ async function wechatPrepare() {
   }
 }
 
+async function warmupBatch() {
+  busy.value = true;
+  try {
+    const result = await api.warmupBatch({ account_ids: selectedIds.value });
+    if (result.ok) {
+      ElMessage.success(`批量预热已启动：${result.accounts || 0} 个账号（加购+联系人+支付，无需库存）`);
+    } else {
+      ElMessage.error(result.error || "批量预热失败");
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || "批量预热失败");
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function wechatPrepareBatch() {
   busy.value = true;
   try {
@@ -815,9 +831,13 @@ onUnmounted(() => {
             <el-button :loading="busy" @click="wechatPrepare"
               >准备下单会话</el-button
             >
+            <el-button :loading="busy" type="warning" @click="warmupBatch">
+              批量预热（无需库存）
+            </el-button>
             <el-button :loading="busy" @click="wechatPrepareBatch"
-              >批量准备全部账号会话</el-button
             >
+              批量准备全部账号会话
+            </el-button>
             <el-button :loading="busy" @click="wechatOrder(false)"
               >演练</el-button
             >
