@@ -16,7 +16,7 @@ async function load() {
   try {
     logs.value = (await api.logs()) || [];
   } finally {
-    load();
+    loading.value = false;
   }
 }
 
@@ -64,17 +64,16 @@ function timeShort(ms: number) {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 const { state: wsState, logs: wsLogs, connected: wsConnected } = useRealtime();
-watch(wsState, (newState: any) => {
+
 watch(wsLogs, newLogs => {
   if (newLogs && wsConnected.value) {
     logs.value = [...newLogs].reverse();
     loading.value = false;
   }
 }, { immediate: true });
-  if (newState) {
-    logs.value = [];
-    load();
-  }
+
+watch(wsState, () => {
+  // State updates come via wsLogs above; no action needed here
 }, { immediate: true });
 
 onMounted(async () => {
