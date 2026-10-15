@@ -9,6 +9,7 @@ import {
   type StoreInfo,
   type StockResult
 } from "@/api/client";
+import { useRealtime } from "@/composables/useRealtime";
 import {
   cookieStatusText,
   formatDuration,
@@ -387,6 +388,13 @@ function exportReport() {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+const { state: wsState, connected: wsConnected } = useRealtime();
+watch(wsState, (newState: any) => {
+  if (newState && newState.accounts) {
+    state.value = newState;
+  }
+}, { immediate: true });
+
 onMounted(async () => {
   try {
     const [stateResult, modelList, storeList] = await Promise.all([
@@ -406,9 +414,10 @@ onMounted(async () => {
     await loadWechatDetail(true);
     fillSettings();
     pollTimer = setInterval(async () => {
+      if (document.visibilityState !== 'visible') return;
       await load();
       fillSettings();
-    }, 2000);
+    }, 5000);
   } catch (error: any) {
     console.error("monitor init failed:", error);
   }
@@ -870,3 +879,4 @@ onUnmounted(() => {
   line-height: 1.6;
 }
 </style>
+

@@ -11,6 +11,7 @@
 <script lang="ts">
 import { defineComponent, onMounted, onUnmounted, ref } from "vue";
 import { ElConfigProvider } from "element-plus";
+import { initRealtime } from "@/composables/useRealtime";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
 
 export default defineComponent({
@@ -22,6 +23,7 @@ export default defineComponent({
     let checkTimer: ReturnType<typeof setInterval> | null = null;
 
     onMounted(() => {
+    initRealtime();
       checkTimer = setInterval(async () => {
         try {
           const response = await fetch("/api/state", { signal: AbortSignal.timeout(3000) });
@@ -55,3 +57,4 @@ export default defineComponent({
   text-align: center;
 }
 </style>
+

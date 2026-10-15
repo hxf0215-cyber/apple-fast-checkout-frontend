@@ -14,6 +14,7 @@ import {
   modelLabel,
   statusText
 } from "@/utils/apple";
+import { useRealtime } from "@/composables/useRealtime";
 
 defineOptions({ name: "Overview" });
 
@@ -170,7 +171,9 @@ onMounted(async () => {
     orders.value = state.orders || [];
     models.value = modelList || [];
     stores.value = storeList || [];
-    pollTimer = setInterval(load, 1500);
+  pollTimer = setInterval(() => {
+    if (!wsConnected.value && document.visibilityState === 'visible') load();
+  }, 5000);
   } catch (error: any) {
     console.error("overview init failed:", error);
   }
@@ -179,6 +182,18 @@ onMounted(async () => {
 watch(orderKeyword, () => {
   groupsInitialized.value = false;
 });
+
+// WebSocket
+const { state: wsState, connected: wsConnected } = useRealtime();
+
+// WebSocket 推送更新
+watch(wsState, newState => {
+  if (newState && newState.accounts) {
+    accounts.value = newState.accounts;
+    orders.value = newState.orders || [];
+    loading.value = false;
+  }
+}, { immediate: true });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);

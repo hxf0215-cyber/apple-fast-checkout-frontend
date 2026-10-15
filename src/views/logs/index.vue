@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api, type ApiLog } from "@/api/client";
+import { useRealtime } from "@/composables/useRealtime";
 
 defineOptions({ name: "Logs" });
 
@@ -15,7 +16,7 @@ async function load() {
   try {
     logs.value = (await api.logs()) || [];
   } finally {
-    loading.value = false;
+    load();
   }
 }
 
@@ -62,9 +63,19 @@ function timeShort(ms: number) {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+const { state: wsState, connected: wsConnected } = useRealtime();
+watch(wsState, (newState: any) => {
+  if (newState) {
+    logs.value = [];
+    load();
+  }
+}, { immediate: true });
+
 onMounted(async () => {
   await load();
-  pollTimer = setInterval(load, 1500);
+  pollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') load();
+  }, 5000);
 });
 
 onUnmounted(() => {
@@ -262,3 +273,4 @@ onUnmounted(() => {
   color: var(--el-text-color-secondary);
 }
 </style>
+

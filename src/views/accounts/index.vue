@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api, type AccountStatus, type PhoneModel } from "@/api/client";
+import { useRealtime } from "@/composables/useRealtime";
 import { cookieStatusText, modelLabel, statusText } from "@/utils/apple";
 
 defineOptions({ name: "Accounts" });
@@ -96,9 +97,19 @@ async function deleteOne(id: string) {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+const { state: wsState, connected: wsConnected } = useRealtime();
+watch(wsState, (newState: any) => {
+  if (newState && newState.accounts) {
+    accounts.value = newState.accounts;
+    loading.value = false;
+  }
+}, { immediate: true });
+
 onMounted(async () => {
   await load();
-  pollTimer = setInterval(load, 2500);
+  pollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') load();
+  }, 5000);
 });
 
 onUnmounted(() => {
@@ -249,5 +260,6 @@ onUnmounted(() => {
   margin-top: 12px;
 }
 </style>
+
 
 
