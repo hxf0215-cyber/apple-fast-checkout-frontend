@@ -63,8 +63,14 @@ function timeShort(ms: number) {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-const { state: wsState, connected: wsConnected } = useRealtime();
+const { state: wsState, logs: wsLogs, connected: wsConnected } = useRealtime();
 watch(wsState, (newState: any) => {
+watch(wsLogs, newLogs => {
+  if (newLogs && wsConnected.value) {
+    logs.value = [...newLogs].reverse();
+    loading.value = false;
+  }
+}, { immediate: true });
   if (newState) {
     logs.value = [];
     load();
