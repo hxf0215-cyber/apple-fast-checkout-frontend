@@ -196,6 +196,16 @@ onUnmounted(() => {
             cookieStatusText(row.wechat_cookie_status)
           }}</template>
         </el-table-column>
+        <el-table-column label="会话状态" width="110">
+          <template #default="{ row }">
+            <el-tag v-if="row.wechat_session_fresh_count > 0" type="success" size="small">
+              ✅ 就绪
+            </el-tag>
+            <el-tag v-else type="info" size="small">
+              ❌ 未准备
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="90">
           <template #default="{ row }"
             ><el-tag

@@ -296,15 +296,14 @@ onUnmounted(() => {
           <template #default="{ row }">{{ row.phone || "-" }}</template>
         </el-table-column>
         <el-table-column label="会话" min-width="130">
-          <template #default="{ row }"
-            >{{ row.wechat_session_fresh_count || 0 }}/{{
-              row.wechat_session_count || 0
-            }}{{
-              row.wechat_session_min_remaining_ms
-                ? ` · ${formatDuration(row.wechat_session_min_remaining_ms)}`
-                : ""
-            }}</template
-          >
+          <template #default="{ row }">
+            <el-tag v-if="row.wechat_session_fresh_count > 0" type="success" size="small">
+              ✅ {{ row.wechat_session_fresh_count }} 组就绪
+            </el-tag>
+            <el-tag v-else type="danger" size="small">
+              ❌ 未准备
+            </el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="Cookie" width="100">
           <template #default="{ row }">{{
