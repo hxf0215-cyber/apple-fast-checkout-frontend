@@ -1369,7 +1369,7 @@ impl WeChatFlow {
     ///  - 有货 → spokes 里带 timeSlot
     ///  - 无货 → 不带
     /// 返回 (spokes, has_time_slot, 原始响应)
-    pub async fn refresh_pickup_checkout(&mut self) -> Result<(Vec<Value>, bool, Value)> {
+    pub async fn refresh_pickup_checkout(&mut self) -> Result<(Vec<Value>, bool, Value, String)> {
         let url = self
             .landing
             .pointer("/pickup/selectStoreUrl")
@@ -1393,7 +1393,29 @@ impl WeChatFlow {
         let has_time_slot = spokes.iter().any(|spoke| {
             spoke.get("id").and_then(Value::as_str) == Some("timeSlot")
         });
-        Ok((spokes, has_time_slot, data))
+        // 诊断摘要：状态、取货可用性、告警，用于 watch 每轮日志
+        let status = data.get("view").and_then(Value::as_str).unwrap_or("-").to_string();
+        let alerts = data
+            .pointer("/review/alerts")
+            .or_else(|| data.get("alerts"))
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|a| {
+                        a.get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| a.get("title").and_then(Value::as_str))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .unwrap_or_default();
+        let digest = if alerts.is_empty() {
+            format!("view={status}")
+        } else {
+            format!("view={status} alerts={alerts}")
+        };
+        Ok((spokes, has_time_slot, data, digest))
     }
 
     /// watch 命中后：从 timeSlot 开始把剩余结账步骤走完并提交。
@@ -1778,9 +1800,10 @@ pub async fn run_wechat_flow(payload: Value) -> Value {
             let state = payload.get("state").cloned().unwrap_or(json!({}));
             flow.restore_from_state(&state);
             match flow.refresh_pickup_checkout().await {
-            Ok((spokes, has_time_slot, _data)) => Ok(json!({
+            Ok((spokes, has_time_slot, _data, digest)) => Ok(json!({
                 "ok": true,
                 "has_time_slot": has_time_slot,
+                "digest": digest,
                 "spokes": spokes.iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
                 "part": flow.part,
                 "store": flow.store,

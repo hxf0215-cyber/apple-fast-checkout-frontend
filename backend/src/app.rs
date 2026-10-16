@@ -700,6 +700,11 @@ fn is_retryable_wechat_session_error(result: &Value) -> bool {
 /// Rust 的 `&s[..n]` 要求 n 必须落在 UTF-8 字符边界上，否则 panic。
 /// Apple 的响应/错误信息常含中文，`&s[..s.len().min(N)]` 这种写法
 /// 在截断点正好落在多字节字符中间时会直接崩掉整个请求，必须用本函数。
+/// 判断错误是否属于 Apple 限流（541）。
+fn is_rate_limit_error(err: &str) -> bool {
+    err.contains("541") || err.to_lowercase().contains("too many requests")
+}
+
 pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
@@ -1350,8 +1355,10 @@ impl AppState {
         let _ = append_log_file(&entry);
         let mut logs = self.inner.logs.lock().await;
         logs.push(entry);
-        if logs.len() > 500 {
-            let start = logs.len() - 500;
+        // watch 模式每轮都会写日志，缓冲太小会把订单等关键日志挤掉。
+        const LOG_BUFFER_MAX: usize = 3000;
+        if logs.len() > LOG_BUFFER_MAX {
+            let start = logs.len() - LOG_BUFFER_MAX;
             logs.drain(0..start);
         }
     }
@@ -2049,6 +2056,101 @@ impl AppState {
         }
         assign.insert(account.id.clone(), chosen.clone());
         chosen
+    }
+
+    /// 541（Apple 限流）时换一个可用出口。
+    ///
+    /// 顺序：
+    ///   1. 静态 IP 轮转（每次换到下一个未被其它账号占用的 IP）
+    ///   2. 动态代理池 take_one（取用即从池中移除，不会重复分配）
+    ///
+    /// 返回 Some(新代理 URL)。两者都不可用时返回 None（调用方应等待后重试）。
+    pub async fn switch_proxy_on_rate_limit(
+        self: &Self,
+        account_id: &str,
+        current: &str,
+    ) -> Option<String> {
+        // 1) 静态 IP：账号 → IP 的固定映射，被限流后轮转到下一个
+        if let Some(next) = self.rotate_static_proxy(account_id).await {
+            if next != current {
+                return Some(next);
+            }
+        }
+        // 2) 动态池：取一个测活通过的 IP（take_one 会把它从池里移除）
+        for _ in 0..3 {
+            let Some(next) = self.inner.proxy_pool.take_one().await else {
+                break;
+            };
+            if next == current {
+                continue;
+            }
+            self.inner
+                .account_proxy_assign
+                .lock()
+                .await
+                .insert(account_id.to_string(), next.clone());
+            return Some(next);
+        }
+        None
+    }
+
+
+    /// 账号当前绑定的静态 IP 被 Apple 限流（541）时，换一个未占用的静态 IP。
+    ///
+    /// 返回 Some(新代理)。若未启用静态 IP、或没有其它可用 IP，返回 None。
+    ///
+    /// 注意：只换「静态 IP」；动态池由既有 take_one 逻辑处理。
+    pub async fn rotate_static_proxy(self: &Self, account_id: &str) -> Option<String> {
+        let (proxies, enabled) = {
+            let config = self.inner.config.lock().await;
+            (
+                config.settings.static_proxies.clone(),
+                config.settings.static_proxy_enabled,
+            )
+        };
+        if !enabled || proxies.is_empty() {
+            return None;
+        }
+        let normalized: Vec<String> = proxies
+            .iter()
+            .map(|p| normalize_static_proxy(p))
+            .filter(|p| !p.is_empty())
+            .collect();
+        if normalized.len() <= 1 {
+            return None;
+        }
+        let mut assign = self.inner.static_proxy_assign.lock().await;
+        let current = assign.get(account_id).cloned().unwrap_or_default();
+        // 其它存活账号占用的 IP 不能抢
+        let live_ids: std::collections::HashSet<String> = {
+            let config = self.inner.config.lock().await;
+            config.accounts.iter().map(|a| a.id.clone()).collect()
+        };
+        let taken: std::collections::HashSet<String> = assign
+            .iter()
+            .filter(|(id, _)| *id != account_id && live_ids.contains(*id))
+            .map(|(_, proxy)| proxy.clone())
+            .collect();
+        // 从当前 IP 的下一个开始轮转，找第一个既不是当前、也未被占用的
+        let current_idx = normalized.iter().position(|p| *p == current).unwrap_or(0);
+        for offset in 1..=normalized.len() {
+            let idx = (current_idx + offset) % normalized.len();
+            let candidate = &normalized[idx];
+            if *candidate != current && !taken.contains(candidate) {
+                assign.insert(account_id.to_string(), candidate.clone());
+                return Some(candidate.clone());
+            }
+        }
+        // 都占用了：退而求其次，取一个不同于当前的
+        for offset in 1..=normalized.len() {
+            let idx = (current_idx + offset) % normalized.len();
+            let candidate = &normalized[idx];
+            if *candidate != current {
+                assign.insert(account_id.to_string(), candidate.clone());
+                return Some(candidate.clone());
+            }
+        }
+        None
     }
 
     pub async fn release_account_proxy(self: &Self, account_id: &str) {
@@ -6428,15 +6530,174 @@ pub async fn api_watch_start(
                     .await;
             } else {
                 let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-                watch_state
-                    .log(&account.id, "error", format!("watch 建立结账态失败：{err}"))
-                    .await;
+                // 建态阶段遇 541：换出口（静态 IP / 动态池）后重试。
+                // 最多尝试 max_setup_attempts 次，避免静态 IP 只有一条时死循环。
+                let rate_limited = is_rate_limit_error(err);
+                let mut ok_now = false;
+                if rate_limited {
+                    if let Some(next) = watch_state
+                        .switch_proxy_on_rate_limit(&account.id, &proxy)
+                        .await
+                    {
+                        watch_state
+                            .log(
+                                &account.id,
+                                "warn",
+                                format!(
+                                    "watch 建态遇 541，切换出口：{} → {}，重试建态",
+                                    display_proxy(&proxy),
+                                    display_proxy(&next),
+                                ),
+                            )
+                            .await;
+                        let retry = run_wechat_bridge(json!({
+                            "mode": "watch-setup",
+                            "cookie": account.wechat_cookie,
+                            "part": part,
+                            "store": store,
+                            "contact": contact,
+                            "proxy": next,
+                            "debug": false,
+                        }))
+                        .await;
+                        if retry.get("ok") == Some(&json!(true)) {
+                            watch_state
+                                .persist_wechat_cookie_from_result(&account.id, &retry)
+                                .await;
+                            let st = json!({
+                                "cookies": retry.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                                "landing": retry.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                                "line_item_id": retry.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                                "stk": retry.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                                "model": retry.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                                "session_id": retry.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                                "part": part,
+                                "store": store,
+                                "proxy_url": next,
+                            });
+                            ready.push((
+                                account.id.clone(),
+                                part.clone(),
+                                store.clone(),
+                                st,
+                                next,
+                                contact.clone(),
+                            ));
+                            watch_state
+                                .log(
+                                    &account.id,
+                                    "info",
+                                    format!("watch 结账态就绪（换 IP 后）：{part} · {store}"),
+                                )
+                                .await;
+                            ok_now = true;
+                        }
+                    }
+                }
+                if !ok_now {
+                    watch_state
+                        .log(&account.id, "error", format!("watch 建立结账态失败：{err}"))
+                        .await;
+                }
             }
         }
 
-        if ready.is_empty() {
-            watch_state.log("batch", "error", "watch 无可守候账号，任务退出").await;
-            return;
+        // 建态失败（多为 541）：不退出，持续重试直到至少一个账号就绪。
+        let mut setup_round: u64 = 0;
+        while ready.is_empty() {
+            setup_round += 1;
+            if max_refresh > 0 && setup_round > max_refresh {
+                watch_state
+                    .log(
+                        "batch",
+                        "warn",
+                        format!("watch 建态重试已达上限 {max_refresh} 次，任务停止"),
+                    )
+                    .await;
+                return;
+            }
+            watch_state
+                .log(
+                    "batch",
+                    "warn",
+                    format!(
+                        "watch 建态未成功（第 {setup_round} 轮），{}ms 后重试全部账号",
+                        interval_ms,
+                    ),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            for account in &accounts {
+                let proxy = watch_state
+                    .resolve_account_proxy(account)
+                    .await
+                    .unwrap_or_default();
+                let parts = if account.parts.is_empty() {
+                    vec![account.part.clone()]
+                } else {
+                    account.parts.clone()
+                };
+                let pick = if parts.len() == 1 {
+                    0
+                } else {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(0..parts.len())
+                };
+                let part = parts[pick].clone();
+                let contact = json!({
+                    "lastName": account.contact.last_name,
+                    "firstName": account.contact.first_name,
+                    "emailAddress": account.contact.email,
+                    "fullDaytimePhone": account.contact.phone,
+                    "nationalId": account.contact.national_id_suffix,
+                });
+                let store = if account.store_id.trim().is_empty() {
+                    account.stores.first().cloned().unwrap_or_default()
+                } else {
+                    account.store_id.clone()
+                };
+                let result = run_wechat_bridge(json!({
+                    "mode": "watch-setup",
+                    "cookie": account.wechat_cookie,
+                    "part": part,
+                    "store": store,
+                    "contact": contact,
+                    "proxy": proxy,
+                    "debug": false,
+                }))
+                .await;
+                if result.get("ok") == Some(&json!(true)) {
+                    watch_state
+                        .persist_wechat_cookie_from_result(&account.id, &result)
+                        .await;
+                    let st = json!({
+                        "cookies": result.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                        "landing": result.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                        "line_item_id": result.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                        "stk": result.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                        "model": result.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                        "session_id": result.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                        "part": part,
+                        "store": store,
+                        "proxy_url": proxy,
+                    });
+                    ready.push((
+                        account.id.clone(),
+                        part.clone(),
+                        store.clone(),
+                        st,
+                        proxy,
+                        contact,
+                    ));
+                    watch_state
+                        .log(
+                            &account.id,
+                            "info",
+                            format!("watch 结账态就绪：{part} · {store}"),
+                        )
+                        .await;
+                }
+            }
         }
         watch_state
             .log(
@@ -6472,16 +6733,152 @@ pub async fn api_watch_start(
                 .await;
                 if result.get("ok") != Some(&json!(true)) {
                     let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-                    watch_state
-                        .log(&account_id, "warn", format!("watch 刷新失败（跳过本轮）：{err}"))
-                        .await;
-                    still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                    // 541（Apple 限流）→ 换出口（静态 IP 轮转 / 动态池取新 IP）。
+                    // 无论如何都不中断：换完 IP 重建结账态继续守候。
+                    let is_rate_limited = is_rate_limit_error(err);
+                    let next_proxy = if is_rate_limited {
+                        watch_state
+                            .switch_proxy_on_rate_limit(&account_id, &proxy)
+                            .await
+                    } else {
+                        None
+                    };
+                    match next_proxy {
+                        Some(next) => {
+                            watch_state
+                                .log(
+                                    &account_id,
+                                    "warn",
+                                    format!(
+                                        "watch 刷新遇 541，切换出口：{} → {}，用新代理重建结账态",
+                                        display_proxy(&proxy),
+                                        display_proxy(&next),
+                                    ),
+                                )
+                                .await;
+                            // 换 IP 后 Apple 侧的结账会话绑定在旧出口，必须重建。
+                            // 用新 IP 重跑 watch-setup（清空购物车 → 加购 → 走到 select_store）。
+                            let cookie = {
+                                let config = watch_state.inner.config.lock().await;
+                                config
+                                    .accounts
+                                    .iter()
+                                    .find(|a| a.id == account_id)
+                                    .map(|a| a.wechat_cookie.clone())
+                                    .unwrap_or_default()
+                            };
+                            let rebuilt = run_wechat_bridge(json!({
+                                "mode": "watch-setup",
+                                "cookie": cookie,
+                                "part": part,
+                                "store": store,
+                                "contact": contact,
+                                "proxy": next,
+                                "debug": false,
+                            }))
+                            .await;
+                            if rebuilt.get("ok") == Some(&json!(true)) {
+                                watch_state
+                                    .persist_wechat_cookie_from_result(&account_id, &rebuilt)
+                                    .await;
+                                let new_state = json!({
+                                    "cookies": rebuilt.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                                    "landing": rebuilt.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                                    "line_item_id": rebuilt.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                                    "stk": rebuilt.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                                    "model": rebuilt.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                                    "session_id": rebuilt.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                                    "part": part,
+                                    "store": store,
+                                    "proxy_url": next,
+                                });
+                                watch_state
+                                    .log(
+                                        &account_id,
+                                        "info",
+                                        format!("watch 已用新 IP 重建结账态：{}", display_proxy(&next)),
+                                    )
+                                    .await;
+                                still.push((
+                                    account_id,
+                                    part,
+                                    store,
+                                    new_state,
+                                    next,
+                                    contact.clone(),
+                                ));
+                            } else {
+                                let e2 = rebuilt
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("未知错误");
+                                watch_state
+                                    .log(
+                                        &account_id,
+                                        "error",
+                                        format!("watch 切换 IP 后重建结账态失败：{e2}"),
+                                    )
+                                    .await;
+                                // 保留旧快照 + 新 IP，下一轮再试
+                                still.push((account_id, part, store, state_snapshot, next, contact.clone()));
+                            }
+                        }
+                        None => {
+                            // 换不到新 IP（池空 / 只有一条静态 IP）：保留当前出口，
+                            // 下一轮继续重试，绝不中断守候。
+                            watch_state
+                                .log(
+                                    &account_id,
+                                    "warn",
+                                    if is_rate_limited {
+                                        format!(
+                                            "watch 遇 541 但暂无可用备用 IP（当前 {}），{}ms 后继续重试",
+                                            display_proxy(&proxy),
+                                            interval_ms,
+                                        )
+                                    } else {
+                                        format!("watch 刷新失败（保留守候，下一轮重试）：{err}")
+                                    },
+                                )
+                                .await;
+                            still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                        }
+                    }
                     continue;
                 }
                 let has_slot = result
                     .pointer("/result/has_time_slot")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // 每轮都输出：否则用户无法判断 watch 是否真的在刷新
+                let spokes = result
+                    .pointer("/result/spokes")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let digest = result
+                    .pointer("/result/digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // 每轮都用 info：用户需要看到 watch 确实在刷新。
+                // 注意：高频刷新会快速填满日志缓冲，因此下方把缓冲上限调大。
+                watch_state
+                    .log(
+                        &account_id,
+                        "info",
+                        format!(
+                            "watch 第 {rounds} 轮 [{part} · {store}] 刷新 {} · timeSlot={} · spokes=[{spokes}]{}",
+                            if has_slot { "命中" } else { "正常" },
+                            if has_slot { "有" } else { "无" },
+                            if digest.is_empty() { String::new() } else { format!(" · {digest}") },
+                        ),
+                    )
+                    .await;
                 if !has_slot {
                     still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
                     continue;
@@ -6537,11 +6934,75 @@ pub async fn api_watch_start(
                         .await;
                 } else {
                     let err = finish.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-                    watch_state
-                        .log(&account_id, "error", format!("watch 下单失败：{err}"))
-                        .await;
-                    // 失败则继续守候（结账态可能已被消费，下一轮会重建）
-                    still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                    // 541 → 换出口后重建结账态，继续守候；其它错误也保留守候。
+                    let rl = is_rate_limit_error(err);
+                    let next = if rl {
+                        watch_state
+                            .switch_proxy_on_rate_limit(&account_id, &proxy)
+                            .await
+                    } else {
+                        None
+                    };
+                    match next {
+                        Some(np) => {
+                            watch_state
+                                .log(
+                                    &account_id,
+                                    "warn",
+                                    format!(
+                                        "watch 下单遇 541，切换出口：{} → {}，重建结账态后继续守候",
+                                        display_proxy(&proxy),
+                                        display_proxy(&np),
+                                    ),
+                                )
+                                .await;
+                            let cookie = {
+                                let config = watch_state.inner.config.lock().await;
+                                config
+                                    .accounts
+                                    .iter()
+                                    .find(|a| a.id == account_id)
+                                    .map(|a| a.wechat_cookie.clone())
+                                    .unwrap_or_default()
+                            };
+                            let rebuilt = run_wechat_bridge(json!({
+                                "mode": "watch-setup",
+                                "cookie": cookie,
+                                "part": part,
+                                "store": store,
+                                "contact": contact,
+                                "proxy": np,
+                                "debug": false,
+                            }))
+                            .await;
+                            if rebuilt.get("ok") == Some(&json!(true)) {
+                                watch_state
+                                    .persist_wechat_cookie_from_result(&account_id, &rebuilt)
+                                    .await;
+                                let ns = json!({
+                                    "cookies": rebuilt.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                                    "landing": rebuilt.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                                    "line_item_id": rebuilt.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                                    "stk": rebuilt.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                                    "model": rebuilt.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                                    "session_id": rebuilt.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                                    "part": part,
+                                    "store": store,
+                                    "proxy_url": np,
+                                });
+                                still.push((account_id, part, store, ns, np, contact.clone()));
+                            } else {
+                                still.push((account_id, part, store, state_snapshot, np, contact.clone()));
+                            }
+                        }
+                        None => {
+                            watch_state
+                                .log(&account_id, "error", format!("watch 下单失败：{err}"))
+                                .await;
+                            // 保留守候，下一轮继续
+                            still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                        }
+                    }
                 }
             }
             if still.is_empty() {
