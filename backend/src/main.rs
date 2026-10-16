@@ -1,5 +1,56 @@
 use std::net::SocketAddr;
 
+/// 版本号：由 build.rs 在编译时注入（取自 Cargo.toml）。
+pub const APP_VERSION: &str = "0.2.0";
+/// 构建时间：运行时读取 exe 自身的修改时间。
+/// 比 build.rs 注入更可靠 —— build.rs 会被 cargo 缓存，不会每次编译都重跑，
+/// 导致时间戳停留在首次编译。读 exe mtime 则始终反映当前二进制。
+pub fn build_stamp() -> String {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let Ok(exe) = std::env::current_exe() else {
+                return "unknown".to_string();
+            };
+            let Ok(meta) = std::fs::metadata(&exe) else {
+                return "unknown".to_string();
+            };
+            let Ok(modified) = meta.modified() else {
+                return "unknown".to_string();
+            };
+            let secs = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // 本机是 UTC+8，统一按北京时间展示（build.rs 里也用同一算法）
+            let (y, mo, d, h, mi) = civil_from_unix(secs + 8 * 3600);
+            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+        })
+        .clone()
+}
+
+/// Unix 秒 → (年, 月, 日, 时, 分)，UTC。
+/// 采用 Howard Hinnant 的 civil_from_days 算法，零依赖。
+fn civil_from_unix(secs: i64) -> (i32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if mo <= 2 { y + 1 } else { y } as i32;
+    (y, mo, d, h, mi)
+}
+/// 构建时的 git 短哈希，便于定位提交。
+pub const GIT_HASH: &str = "unknown";
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -152,6 +203,15 @@ async fn add_cache_headers(
     res
 }
 
+/// 返回当前版本信息。前端用它显示版本号，也便于脚本校验部署的是哪一版。
+async fn api_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "version": APP_VERSION,
+        "build": build_stamp(),
+        "git": GIT_HASH,
+    }))
+}
+
 #[tokio::main]
 async fn main() {
     // 必须在读取任何资源前执行：修正工作目录到 exe 所在目录
@@ -165,6 +225,7 @@ async fn main() {
         .route("/", get(vue_index))
         .route("/ws", get(ws_handler))
         .route("/api/state", get(app::api_state))
+        .route("/api/version", get(api_version))
         .route("/api/logs", get(app::api_logs))
         .route("/api/logs/clear", post(app::api_clear_logs))
         .route("/api/models", get(app::api_models))
@@ -234,11 +295,22 @@ async fn main() {
     };
 
     println!("========================================");
-    println!("  Apple Fast Checkout 已启动");
+    println!("  Apple Fast Checkout");
+    println!("  版本: {APP_VERSION}  构建: {}", build_stamp());
+    println!("  Git:  {GIT_HASH}");
+    println!("----------------------------------------");
     println!("  控制台地址: http://127.0.0.1:{port}");
     println!("  局域网访问: http://本机IP:{port}");
     println!("  关闭本窗口即停止服务");
     println!("========================================");
+
+    // Windows：设置控制台窗口标题，方便在任务栏/多窗口时辨认版本
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", &format!("title Apple Fast Checkout {APP_VERSION} - {}", build_stamp())])
+            .spawn();
+    }
 
     // 自动打开浏览器（失败不影响服务）
     let url = format!("http://127.0.0.1:{port}");

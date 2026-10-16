@@ -9,6 +9,10 @@ defineOptions({ name: "Logs" });
 const logs = ref<ApiLog[]>([]);
 const loading = ref(false);
 const keyword = ref("");
+
+// 当前后端版本：显示在标题旁，便于确认部署的是哪一版
+const serverVersion = ref<string>("");
+const serverBuild = ref<string>("");
 const expanded = ref<Set<string>>(new Set());
 
 // 单页最多渲染的日志条数：日志量大时 DOM 节点是主要瓶颈
@@ -108,6 +112,14 @@ watch(wsState, () => {
 }, { immediate: true });
 
 onMounted(async () => {
+  // 拉取版本信息（失败不影响日志功能）
+  try {
+    const v = await api.version();
+    serverVersion.value = v?.version || "";
+    serverBuild.value = v?.build || "";
+  } catch (error) {
+    console.warn("fetch version failed:", error);
+  }
   await load();
   // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
 });
@@ -140,7 +152,17 @@ watch(
     <el-card shadow="never" class="app-card app-card-fill">
       <template #header>
         <div class="card-header">
-          <span>运行日志</span>
+          <div class="title-group">
+            <span>运行日志</span>
+            <el-tag
+              v-if="serverVersion"
+              type="info"
+              size="small"
+              effect="plain"
+            >
+              v{{ serverVersion }} · {{ serverBuild }}
+            </el-tag>
+          </div>
           <div class="header-tools">
             <el-input
               v-model="keyword"
@@ -191,6 +213,11 @@ watch(
 
 <style scoped>
 .card-header {
+.title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
   display: flex;
   align-items: center;
   justify-content: space-between;

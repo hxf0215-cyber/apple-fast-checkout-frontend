@@ -219,6 +219,11 @@ export type WechatStep = {
 
 export const api = {
   state: () => http.get<null, AppStatePayload>("/api/state"),
+  // 版本信息：用于界面显示当前构建版本，便于确认是否加载了最新前端
+  version: () =>
+    http.get<null, { version: string; build: string; git: string }>(
+      "/api/version"
+    ),
   logs: () => http.get<null, ApiLog[]>("/api/logs"),
   clearLogs: () =>
     http.post<null, { ok: boolean; removed_files: number }>("/api/logs/clear", {
