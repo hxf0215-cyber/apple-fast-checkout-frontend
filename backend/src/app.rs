@@ -538,6 +538,18 @@ fn summarize_wechat_steps(steps: &[Value]) -> String {
         .iter()
         .filter(|step| step.get("name").and_then(Value::as_str) == Some("delete_item"))
         .count();
+    let added_count = steps
+        .iter()
+        .filter(|step| step.get("name").and_then(Value::as_str) == Some("add_cart"))
+        .count();
+    // 购物袋处理说明：
+    //  - 没有 delete_item / add_cart → 购物袋本来就是「目标商品 1×1」，走了快路径；
+    //  - 有 → 说明执行了清空 + 重新加购。
+    let cart_note = if added_count == 0 && deleted_count == 0 {
+        "购物袋已就绪（预加购命中，直接进入结账）".to_string()
+    } else {
+        format!("已强制清空购物车并删除旧商品 {deleted_count} 项 · 加购后校验为 1 个目标商品")
+    };
     let detail = steps
         .iter()
         .map(|step| {
@@ -551,11 +563,11 @@ fn summarize_wechat_steps(steps: &[Value]) -> String {
         .collect::<Vec<_>>()
         .join("；");
     format!(
-        "步骤 {}/{} 成功 · 总耗时 {}ms · 已强制清空购物车并删除旧商品 {} 项 · 加购后校验为 1 个目标商品 · {}",
+        "步骤 {}/{} 成功 · 总耗时 {}ms · {} · {}",
         ok_count,
         steps.len(),
         total_ms,
-        deleted_count,
+        cart_note,
         detail
     )
 }
@@ -4416,6 +4428,16 @@ pub async fn api_wechat_order(
                 ),
             )
             .await;
+        // 失败时也输出步骤汇总：无货/拦截这类情况同样需要看到走了哪些步骤、
+        // 以及购物袋是否命中了「预加购快路径」。
+        if let Some(steps) = result.get("steps").and_then(Value::as_array) {
+            if !steps.is_empty() {
+                let summary = summarize_wechat_steps(steps);
+                state
+                    .log(&account.id, "info", format!("小程序步骤汇总：{summary}"))
+                    .await;
+            }
+        }
     }
 
     Json(result).into_response()
