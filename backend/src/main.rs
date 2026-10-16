@@ -131,6 +131,27 @@ fn set_working_dir_to_exe_dir() {
     }
 }
 
+/// 给响应加缓存控制头，避免前端升级后浏览器仍使用旧资源。
+///
+/// 背景：前端产物里 index.html 是固定文件名，若被浏览器强缓存，
+/// 即使服务端已更新，页面仍会去加载「旧 hash」的 chunk，表现为「改了没生效」。
+/// 这里统一设置为 no-cache（允许缓存但每次必须校验，304 命中时开销很小）。
+async fn add_cache_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut res = next.run(req).await;
+    // 只有静态资源需要这个策略；API 响应本来就带 no-store 语义，不必强改。
+    let is_static = res.headers().get("content-type").is_some();
+    if is_static {
+        res.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache, must-revalidate"),
+        );
+    }
+    res
+}
+
 #[tokio::main]
 async fn main() {
     // 必须在读取任何资源前执行：修正工作目录到 exe 所在目录
@@ -177,7 +198,13 @@ async fn main() {
         .route("/api/settings", post(app::api_update_settings))
         .route("/api/login/start", post(app::api_login_start))
         .route("/api/login/verify", post(app::api_login_verify))
-        .nest_service("/static", ServeDir::new("static"))
+        .nest_service(
+            "/static",
+            ServeDir::new("static")
+        )
+        // 缓存策略：index.html 等入口文件必须每次校验，否则升级后浏览器仍加载旧 JS。
+        // 带 hash 的 chunk 本身可长缓存，但为了简化统一改为 no-cache（协商缓存，命中 304 也很轻）。
+        .layer(axum::middleware::from_fn(add_cache_headers))
         .with_state(state);
 
     // 端口自动探测：8080 被占用时依次尝试后续端口，避免直接崩溃（双击启动时很常见）
