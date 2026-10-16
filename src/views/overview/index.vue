@@ -171,9 +171,7 @@ onMounted(async () => {
     orders.value = state.orders || [];
     models.value = modelList || [];
     stores.value = storeList || [];
-  pollTimer = setInterval(() => {
-    if (!wsConnected.value && document.visibilityState === 'visible') load();
-  }, 5000);
+  // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
   } catch (error: any) {
     console.error("overview init failed:", error);
   }
@@ -198,6 +196,24 @@ watch(wsState, newState => {
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
 });
+
+// 连接正常时停止轮询，仅在断线时启用（减少 CPU 与请求）
+watch(
+  wsConnected,
+  connected => {
+    if (connected) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } else if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        if (document.visibilityState === "visible") load();
+      }, 5000);
+    }
+  },
+  { immediate: true }
+);
 </script>
 <template>
   <div class="app-page">

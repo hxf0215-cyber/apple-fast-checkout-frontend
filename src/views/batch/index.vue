@@ -47,12 +47,16 @@ function settings() {
   };
 }
 
-async function importAccounts(start = false) {
+async function importAccounts() {
   try {
     importing.value = true;
-    await api.importAccounts({ ...settings(), text: form.accounts });
-    if (start) await api.start();
-    router.push("/monitor");
+    const response: any = await api.importAccounts({
+      ...settings(),
+      text: form.accounts
+    });
+    result.value = `导入完成：新增/更新 ${response?.imported ?? 0} 个账号`;
+    ElMessage.success("导入完成，未自动启动监控");
+    router.push("/accounts");
   } catch (error: any) {
     ElMessage.error(error?.message || "导入失败");
   } finally {
@@ -60,7 +64,7 @@ async function importAccounts(start = false) {
   }
 }
 
-async function importCookies(start = false) {
+async function importCookies() {
   try {
     importing.value = true;
     const response = await api.importCookies({
@@ -84,12 +88,9 @@ async function importCookies(start = false) {
       )
       .join("；");
     ElMessage.success(
-      `导入完成：成功 ${success} 条，失败 ${response.failed} 条`
+      `导入完成：成功 ${success} 条，失败 ${response.failed} 条（未自动启动监控）`
     );
-    if (success > 0 && response.failed === 0) {
-      if (start) await api.start();
-      router.push(start ? "/monitor" : "/accounts");
-    }
+    if (success > 0) router.push("/accounts");
   } catch (error: any) {
     ElMessage.error(error?.message || "导入失败");
   } finally {
@@ -170,11 +171,8 @@ onMounted(async () => {
             <el-button
               type="primary"
               :loading="importing"
-              @click="importAccounts(false)"
+              @click="importAccounts()"
               >导入账号</el-button
-            >
-            <el-button :loading="importing" @click="importAccounts(true)"
-              >导入并启动监控</el-button
             >
           </div>
         </el-tab-pane>
@@ -211,11 +209,8 @@ onMounted(async () => {
             <el-button
               type="primary"
               :loading="importing"
-              @click="importCookies(false)"
+              @click="importCookies()"
               >导入 Cookie</el-button
-            >
-            <el-button :loading="importing" @click="importCookies(true)"
-              >导入并启动监控</el-button
             >
           </div>
           <el-alert

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api, type ApiLog } from "@/api/client";
 import { useRealtime } from "@/composables/useRealtime";
@@ -8,8 +8,37 @@ defineOptions({ name: "Logs" });
 
 const logs = ref<ApiLog[]>([]);
 const loading = ref(false);
-const expanded = new Set<string>();
 const keyword = ref("");
+const expanded = ref<Set<string>>(new Set());
+
+// 单页最多渲染的日志条数：日志量大时 DOM 节点是主要瓶颈
+const RENDER_LIMIT = 300;
+
+/** 倒序 + 过滤 + 截断，用 computed 缓存，避免每次渲染都重建数组（原是模板内链式调用） */
+const rendered = computed(() => {
+  const kw = keyword.value.toLowerCase();
+  const source = logs.value;
+  const out: ApiLog[] = [];
+  // 从最新往旧遍历，命中即收集，达到上限就停（避免处理全部 500 条）
+  for (let i = source.length - 1; i >= 0 && out.length < RENDER_LIMIT; i--) {
+    const item = source[i];
+    if (!kw || item.message.toLowerCase().includes(kw)) out.push(item);
+  }
+  return out;
+});
+
+/** 裁剪 expanded 集合：日志轮转后旧 key 会无限累积（内存泄漏） */
+watch(
+  rendered,
+  list => {
+    if (expanded.value.size <= RENDER_LIMIT * 2) return;
+    const alive = new Set(list.map(logKey));
+    const next = new Set<string>();
+    for (const key of expanded.value) if (alive.has(key)) next.add(key);
+    expanded.value = next;
+  },
+  { flush: "post" }
+);
 
 async function load() {
   loading.value = true;
@@ -29,20 +58,22 @@ async function clearLogs() {
   await load();
 }
 
-function logKey(log: ApiLog, index: number) {
-  return `${log.ts_ms}-${index}`;
+function logKey(log: ApiLog) {
+  // 仅依赖日志自身内容，保证新日志插入 / 过滤 / 排序后展开状态不丢失
+  return `${log.ts_ms}-${log.account_id ?? ""}-${log.message}`;
 }
 
-function isExpanded(log: ApiLog, index: number) {
-  return expanded.has(logKey(log, index));
+function isExpanded(log: ApiLog) {
+  return expanded.value.has(logKey(log));
 }
 
-function toggleExpand(log: ApiLog, index: number) {
-  const key = logKey(log, index);
-  if (expanded.has(key)) expanded.delete(key);
-  else expanded.add(key);
+function toggleExpand(log: ApiLog) {
+  const key = logKey(log);
+  if (expanded.value.has(key)) expanded.value.delete(key);
+  else expanded.value.add(key);
+  // Set 是同一个引用，需手动触发响应式更新
+  expanded.value = new Set(expanded.value);
 }
-
 function levelClass(log: ApiLog) {
   if (log.level === "error") return "log-error";
   if (log.level === "warn") return "log-warn";
@@ -78,14 +109,30 @@ watch(wsState, () => {
 
 onMounted(async () => {
   await load();
-  pollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') load();
-  }, 5000);
+  // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
 });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
 });
+
+// 连接正常时停止轮询，仅在断线时启用（减少 CPU 与请求）
+watch(
+  wsConnected,
+  connected => {
+    if (connected) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } else if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        if (document.visibilityState === "visible") load();
+      }, 5000);
+    }
+  },
+  { immediate: true }
+);
 </script>
 
 <template>
@@ -107,17 +154,10 @@ onUnmounted(() => {
       </template>
       <div v-loading="loading" class="log-container">
         <div
-          v-for="(log, index) in logs
-            .slice(-500)
-            .reverse()
-            .filter(
-              item =>
-                !keyword ||
-                item.message.toLowerCase().includes(keyword.toLowerCase())
-            )"
-          :key="log.ts_ms + '-' + index"
+          v-for="log in rendered"
+          :key="logKey(log)"
           :class="['log-entry', levelClass(log)]"
-          @click="toggleExpand(log, index)"
+          @click.stop="toggleExpand(log)"
         >
           <div class="log-line">
             <span class="log-time">{{ timeShort(log.ts_ms) }}</span>
@@ -131,14 +171,14 @@ onUnmounted(() => {
               :class="[
                 'log-message',
                 {
-                  collapsed: !isExpanded(log, index) && log.message.length > 120
+                  collapsed: !isExpanded(log) && log.message.length > 120
                 }
               ]"
             >
               {{ log.message }}
             </span>
             <span v-if="log.message.length > 120" class="log-toggle">
-              {{ isExpanded(log, index) ? "收起" : "展开" }}
+              {{ isExpanded(log) ? "收起" : "展开" }}
             </span>
           </div>
         </div>

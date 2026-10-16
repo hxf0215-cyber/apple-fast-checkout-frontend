@@ -107,14 +107,30 @@ watch(wsState, (newState: any) => {
 
 onMounted(async () => {
   await load();
-  pollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') load();
-  }, 5000);
+  // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
 });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
 });
+
+// 连接正常时停止轮询，仅在断线时启用（减少 CPU 与请求）
+watch(
+  wsConnected,
+  connected => {
+    if (connected) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } else if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        if (document.visibilityState === "visible") load();
+      }, 5000);
+    }
+  },
+  { immediate: true }
+);
 </script>
 
 <template>
@@ -196,14 +212,41 @@ onUnmounted(() => {
             cookieStatusText(row.wechat_cookie_status)
           }}</template>
         </el-table-column>
-        <el-table-column label="会话状态" width="110">
+        <el-table-column label="会话状态" width="130">
           <template #default="{ row }">
-            <el-tag v-if="row.wechat_session_fresh_count > 0" type="success" size="small">
-              ✅ 就绪
-            </el-tag>
-            <el-tag v-else type="info" size="small">
-              ❌ 未准备
-            </el-tag>
+            <el-tooltip
+              :content="`
+                row.wechat_session_checkout_ready
+                  ? '已进入结账页，下单可直接提交（约 3-5 秒）'
+                  : row.wechat_session_fallback_only
+                    ? '当前无货，仅完成购物袋清理与 OpenID 缓存'
+                    : '未准备好下单会话'
+              `"
+              placement="top"
+            >
+              <el-tag
+                v-if="row.wechat_session_checkout_ready"
+                type="success"
+                size="small"
+              >
+                ✅ 可快速下单
+              </el-tag>
+              <el-tag
+                v-else-if="row.wechat_session_fallback_only"
+                type="warning"
+                size="small"
+              >
+                ⚠️ 半预热
+              </el-tag>
+              <el-tag
+                v-else-if="row.wechat_session_fresh_count > 0"
+                type="success"
+                size="small"
+              >
+                ✅ 就绪
+              </el-tag>
+              <el-tag v-else type="info" size="small"> ❌ 未准备 </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90">

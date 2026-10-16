@@ -67,6 +67,10 @@ export type AccountStatus = {
   wechat_session_min_remaining_ms?: number | null;
   wechat_session_part?: string | null;
   wechat_session_store?: string | null;
+  /** 预热会话是否已进结账页，下单可走 place 快速通道 */
+  wechat_session_checkout_ready?: boolean;
+  /** 预热会话是否只是降级预热（当前无货，仅清空购物袋 + 缓存 OpenID） */
+  wechat_session_fallback_only?: boolean;
 };
 
 export type OrderRecord = {
@@ -83,6 +87,7 @@ export type OrderRecord = {
 };
 
 export type BatchProgress = {
+  kind?: "prepare" | "warmup" | "idle" | string;
   running: boolean;
   total: number;
   completed: number;
@@ -108,6 +113,37 @@ export type GlobalSettings = {
   retry_max_attempts: number;
   circuit_breaker_threshold: number;
   circuit_breaker_cooldown_ms: number;
+  // 静态 IP 代理
+  static_proxies: string[];
+  static_proxy_enabled: boolean;
+  // 动态代理池
+  proxy_pool_api: string;
+  proxy_pool_enabled: boolean;
+  // 池上限模式：account（账号数×倍率）/ fixed（固定值）
+  proxy_pool_limit_mode: string;
+  proxy_pool_per_account: number;
+  proxy_pool_fixed_limit: number;
+  // num 参数模式：auto（按需）/ fixed（固定值）
+  proxy_num_mode: string;
+  proxy_num_fixed: number;
+  proxy_check_interval_ms: number;
+  proxy_max_age_ms: number;
+  proxy_pool_low_watermark: number;
+  proxy_fetch_concurrency: number;
+  proxy_pool_fetch_proxy: string;
+  proxy_check_url: string;
+  proxy_pool_format: string;
+};
+
+export type ProxyPoolStats = {
+  enabled: boolean;
+  total: number;
+  alive: number;
+  max_size: number;
+  fetched_total: number;
+  discarded_total: number;
+  check_failures: number;
+  last_fetch_error?: string | null;
 };
 
 export type AppStatePayload = {
@@ -127,6 +163,7 @@ export type AppStatePayload = {
   monitor_available_combos: number;
   monitor_dispatched_count: number;
   orders: OrderRecord[];
+  orders_total?: number;
 };
 
 export type StoreInfo = {
@@ -160,6 +197,9 @@ export const api = {
     }),
   models: () => http.get<null, PhoneModel[]>("/api/models"),
   stores: () => http.get<null, StoreInfo[]>("/static/stores.json"),
+  proxyPoolStats: () => http.get<null, ProxyPoolStats>("/api/proxy-pool/stats"),
+  proxyPoolClear: () => http.post<null, { ok: boolean; cleared: number }>("/api/proxy-pool/clear", { data: {} }),
+  proxyPoolFetch: () => http.post<null, { ok: boolean; fetched?: number; error?: string }>("/api/proxy-pool/fetch", { data: {} }),
   saveSettings: (settings: GlobalSettings) =>
     http.post<null, unknown>("/api/settings", { data: settings }),
   start: () => http.post<null, unknown>("/api/start", { data: {} }),
@@ -211,8 +251,17 @@ export const api = {
       `/api/accounts/${encodeURIComponent(id)}/wechat-prepare`,
       { data }
     ),
-  warmupBatch: (data: { account_ids?: string[] }) =>
-    http.post<null, { ok: boolean; accounts?: number; error?: string }>(
+  warmupBatch: (data: { account_ids?: string[]; parts?: string[]; stores?: string[] }) =>
+    http.post<
+      null,
+      {
+        ok: boolean;
+        accounts?: number;
+        combos?: number;
+        available_combos?: number;
+        error?: string;
+      }
+    >(
       "/api/wechat/warmup-batch",
       { data }
     ),

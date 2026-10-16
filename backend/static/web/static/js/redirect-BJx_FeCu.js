@@ -1,0 +1,1 @@
+import{y as s,aI as c,u as p,z as u,A as _}from"./vendor-vue-Cd8AxmYB.js";const l=s({name:"Redirect",__name:"redirect",setup(i){const{currentRoute:r,replace:t}=c(),{params:a,query:n}=p(r),{path:e}=a,o=Array.isArray(e)?e.join("/"):e;return t({path:"/"+o,query:n}),(m,d)=>(_(),u("div"))}});export{l as default};

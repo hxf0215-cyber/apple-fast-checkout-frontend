@@ -35,6 +35,7 @@ const busy = ref(false);
 const manualResult = ref("");
 const wechatResult = ref("");
 const centralResult = ref("");
+const proxyPoolStats = ref<any>(null);
 // loginDetailId not used
 const wechatDetail = ref<AccountConfig | null>(null);
 const wechatForm = reactive({
@@ -55,7 +56,25 @@ const settingsForm = reactive({
   autoRefreshSessions: true,
   retryEnabled: true,
   monitorParts: [] as string[],
-  monitorStores: [] as string[]
+  monitorStores: [] as string[],
+  // 静态 IP
+  staticProxyEnabled: false,
+  staticProxiesText: "",
+  // 动态代理池
+  proxyPoolEnabled: false,
+  proxyPoolApi: "",
+  proxyPoolFetchProxy: "",
+  proxyPoolLimitMode: "account",
+  proxyPoolPerAccount: 3,
+  proxyPoolFixedLimit: 20,
+  proxyNumMode: "auto",
+  proxyNumFixed: 50,
+  proxyCheckIntervalMs: 10000,
+  proxyMaxAgeMs: 30000,
+  proxyPoolLowWatermark: 5,
+  proxyFetchConcurrency: 5,
+  proxyCheckUrl: "https://www.apple.com.cn",
+  proxyPoolFormat: "line"
 });
 
 const accounts = computed(() => state.value?.accounts || []);
@@ -93,6 +112,18 @@ const filteredAccounts = computed(() => {
 });
 
 const progress = computed(() => state.value?.batch_progress);
+
+/** 批次类型标签：区分「批量预热」与「批量准备会话」（两者共用同一份进度） */
+const progressKindLabel = computed(() => {
+  switch (progress.value?.kind) {
+    case "warmup":
+      return "批量预热";
+    case "prepare":
+      return "批量准备会话";
+    default:
+      return "批量任务";
+  }
+});
 const progressPercent = computed(() =>
   progress.value?.total
     ? Math.round((progress.value.completed / progress.value.total) * 100)
@@ -126,6 +157,44 @@ function fillSettings(force = false) {
   settingsForm.retryEnabled = settings.retry_enabled;
   settingsForm.monitorParts = settings.monitor_parts || [];
   settingsForm.monitorStores = settings.monitor_stores || [];
+  settingsForm.staticProxyEnabled = settings.static_proxy_enabled ?? false;
+  settingsForm.staticProxiesText = (settings.static_proxies || []).join("\n");
+  settingsForm.proxyPoolEnabled = settings.proxy_pool_enabled ?? false;
+  settingsForm.proxyPoolApi = settings.proxy_pool_api || "";
+  settingsForm.proxyPoolFetchProxy = settings.proxy_pool_fetch_proxy || "";
+  settingsForm.proxyPoolLimitMode = settings.proxy_pool_limit_mode || "account";
+  settingsForm.proxyPoolPerAccount = settings.proxy_pool_per_account ?? 3;
+  settingsForm.proxyPoolFixedLimit = settings.proxy_pool_fixed_limit ?? 20;
+  settingsForm.proxyNumMode = settings.proxy_num_mode || "auto";
+  settingsForm.proxyNumFixed = settings.proxy_num_fixed ?? 50;
+  settingsForm.proxyCheckIntervalMs = settings.proxy_check_interval_ms ?? 10000;
+  settingsForm.proxyMaxAgeMs = settings.proxy_max_age_ms ?? 30000;
+  settingsForm.proxyPoolLowWatermark = settings.proxy_pool_low_watermark ?? 5;
+  settingsForm.proxyFetchConcurrency = settings.proxy_fetch_concurrency ?? 5;
+  settingsForm.proxyCheckUrl = settings.proxy_check_url || "https://www.apple.com.cn";
+  settingsForm.proxyPoolFormat = settings.proxy_pool_format || "line";
+}
+
+async function loadProxyPoolStats() {
+  try {
+    proxyPoolStats.value = await api.proxyPoolStats();
+  } catch {
+    // 忽略
+  }
+}
+
+async function clearProxyPool() {
+  await ElMessageBox.confirm("确认清空代理池？", "确认操作", { type: "warning" });
+  const res = await api.proxyPoolClear();
+  ElMessage.success(`已清空 ${res.cleared} 个 IP`);
+  await loadProxyPoolStats();
+}
+
+async function fetchProxyPool() {
+  const res = await api.proxyPoolFetch();
+  if (res.ok) ElMessage.success(`已补充 ${res.fetched || 0} 个 IP`);
+  else ElMessage.error(res.error || "补充失败");
+  await loadProxyPoolStats();
 }
 
 async function saveCentralMonitor() {
@@ -148,7 +217,26 @@ async function saveCentralMonitor() {
       retry_base_delay_ms: settingsForm.retryBaseDelayMs,
       retry_max_attempts: settingsForm.retryMaxAttempts,
       circuit_breaker_threshold: settingsForm.circuitBreakerThreshold,
-      circuit_breaker_cooldown_ms: settingsForm.circuitBreakerCooldownMs
+      circuit_breaker_cooldown_ms: settingsForm.circuitBreakerCooldownMs,
+      static_proxy_enabled: settingsForm.staticProxyEnabled,
+      static_proxies: settingsForm.staticProxiesText
+        .split(/\r?\n/)
+        .map(s => s.trim())
+        .filter(Boolean),
+      proxy_pool_enabled: settingsForm.proxyPoolEnabled,
+      proxy_pool_api: settingsForm.proxyPoolApi.trim(),
+      proxy_pool_fetch_proxy: settingsForm.proxyPoolFetchProxy.trim(),
+      proxy_pool_limit_mode: settingsForm.proxyPoolLimitMode,
+      proxy_pool_per_account: settingsForm.proxyPoolPerAccount,
+      proxy_pool_fixed_limit: settingsForm.proxyPoolFixedLimit,
+      proxy_num_mode: settingsForm.proxyNumMode,
+      proxy_num_fixed: settingsForm.proxyNumFixed,
+      proxy_check_interval_ms: settingsForm.proxyCheckIntervalMs,
+      proxy_max_age_ms: settingsForm.proxyMaxAgeMs,
+      proxy_pool_low_watermark: settingsForm.proxyPoolLowWatermark,
+      proxy_fetch_concurrency: settingsForm.proxyFetchConcurrency,
+      proxy_check_url: settingsForm.proxyCheckUrl.trim(),
+      proxy_pool_format: settingsForm.proxyPoolFormat
     };
     await api.saveSettings(payload);
     state.value.settings = payload;
@@ -171,6 +259,7 @@ async function stopAccount(id: string) {
 }
 
 async function startAll() {
+  if (acting.value) return;
   acting.value = true;
   try {
     await api.start();
@@ -184,6 +273,7 @@ async function startAll() {
 }
 
 async function stopAll() {
+  if (acting.value) return;
   acting.value = true;
   try {
     await api.stop();
@@ -315,12 +405,33 @@ async function wechatPrepare() {
   }
 }
 
+/** 会话状态文案：区分「可直接下单」「仅半预热」「无」 */
+function sessionLabel(account: any) {
+  if (!account?.wechat_session_count) return "无";
+  if (account.wechat_session_checkout_ready) return "✅ 可快速下单";
+  if (account.wechat_session_fallback_only) return "⚠️ 半预热(无货)";
+  return `${account.wechat_session_fresh_count}/${account.wechat_session_count}`;
+}
+
+let warmupRunning = false;
 async function warmupBatch() {
+  if (warmupRunning) {
+    ElMessage.warning("批量预热正在进行中，请稍候");
+    return;
+  }
+  warmupRunning = true;
   busy.value = true;
   try {
-    const result = await api.warmupBatch({ account_ids: selectedIds.value });
+    const result = await api.warmupBatch({
+      account_ids: selectedIds.value,
+      // 把当前监控范围一起传过去：后端会先查库存，优先预热有货组合
+      parts: settingsForm.monitorParts,
+      stores: settingsForm.monitorStores
+    });
     if (result.ok) {
-      ElMessage.success(`批量预热已启动：${result.accounts || 0} 个账号（加购+联系人+支付，无需库存）`);
+      ElMessage.success(
+        `批量预热已启动：${result.accounts || 0} 个账号 · ${result.available_combos ?? 0}/${result.combos ?? 0} 个组合有货（优先预热有货组合）`
+      );
     } else {
       ElMessage.error(result.error || "批量预热失败");
     }
@@ -328,10 +439,17 @@ async function warmupBatch() {
     ElMessage.error(error?.message || "批量预热失败");
   } finally {
     busy.value = false;
+    warmupRunning = false;
   }
 }
 
+let prepareBatchRunning = false;
 async function wechatPrepareBatch() {
+  if (prepareBatchRunning) {
+    ElMessage.warning("批量准备正在进行中，请稍候");
+    return;
+  }
+  prepareBatchRunning = true;
   busy.value = true;
   try {
     const result = await api.wechatPrepareBatch({
@@ -343,6 +461,7 @@ async function wechatPrepareBatch() {
     wechatResult.value = error?.message || "批量准备失败";
   } finally {
     busy.value = false;
+    prepareBatchRunning = false;
   }
 }
 
@@ -367,7 +486,7 @@ function exportReport() {
       account.username,
       account.status,
       account.priority_score,
-      `${account.wechat_session_fresh_count}/${account.wechat_session_count}`,
+      sessionLabel(account),
       account.wechat_cookie_status,
       account.proxy_health,
       account.order_attempts,
@@ -429,11 +548,12 @@ onMounted(async () => {
     wechatForm.part = manualForm.part;
     await loadWechatDetail(true);
     fillSettings();
-    pollTimer = setInterval(async () => {
-      if (document.visibilityState !== 'visible') return;
-      await load();
-      fillSettings();
-    }, 5000);
+    await loadProxyPoolStats();
+    // 代理池状态独立定时刷新（与主轮询解耦）
+    setInterval(() => {
+      if (settingsForm.proxyPoolEnabled) loadProxyPoolStats();
+    }, 10000);
+  // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
   } catch (error: any) {
     console.error("monitor init failed:", error);
   }
@@ -451,6 +571,24 @@ watch(selectedAccountId, id => {
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
 });
+
+// 连接正常时停止轮询，仅在断线时启用（减少 CPU 与请求）
+watch(
+  wsConnected,
+  connected => {
+    if (connected) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } else if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        if (document.visibilityState === "visible") load();
+      }, 5000);
+    }
+  },
+  { immediate: true }
+);
 </script>
 
 <template>
@@ -560,6 +698,108 @@ onUnmounted(() => {
           >保存监控范围</el-button
         >
       </div>
+      <el-divider content-position="left">代理配置</el-divider>
+      <el-form label-width="160px">
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="静态 IP 分配">
+              <el-switch v-model="settingsForm.staticProxyEnabled" />
+              <span class="form-hint">为每个账号固定分配一个独立静态 IP</span>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="动态代理池">
+              <el-switch v-model="settingsForm.proxyPoolEnabled" />
+              <span class="form-hint">从接口动态提取，取用后丢弃</span>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item v-if="settingsForm.staticProxyEnabled" label="静态 IP 列表">
+          <el-input
+            v-model="settingsForm.staticProxiesText"
+            type="textarea"
+            :rows="4"
+            placeholder="每行一个，支持以下格式：&#10;1.2.3.4:8080（无认证）&#10;1.2.3.4|8080|账号|密码（竖线分隔，推荐）&#10;1.2.3.4:8080:账号:密码（冒号分隔）&#10;账号:密码@1.2.3.4:8080（带认证）&#10;socks5://1.2.3.4:1080&#10;（不带协议前缀默认按 http:// 处理）"
+          />
+          <div class="form-hint">
+            竖线格式示例：96.8.121.134|11515|uhe|elz（IP|端口|账号|密码）
+          </div>
+        </el-form-item>
+        <template v-if="settingsForm.proxyPoolEnabled">
+          <el-form-item label="提取接口">
+            <el-input
+              v-model="settingsForm.proxyPoolApi"
+              placeholder="任意供应商接口，如 http://api.xiequ.cn/VAD/GetIp.aspx?...&num=200"
+            />
+            <div class="form-hint">可填入任何代理服务商的提取链接（支持 / 分隔、&amp; 参数、API Key）</div>
+          </el-form-item>
+          <el-form-item label="接口请求代理">
+            <el-input
+              v-model="settingsForm.proxyPoolFetchProxy"
+              placeholder="留空直连；如需绕过接口方白名单，填 socks5://user:pass@host:port"
+            />
+            <div class="form-hint">
+              调用提取接口时使用的出口代理。填了这个，接口方看到的是该代理的 IP，可绕过 IP 白名单限制。
+            </div>
+          </el-form-item>
+          <el-row :gutter="12">
+            <el-col :span="6">
+              <el-form-item label="池上限模式">
+                <el-select v-model="settingsForm.proxyPoolLimitMode">
+                  <el-option label="按账号倍数" value="account" />
+                  <el-option label="固定数量" value="fixed" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col v-if="settingsForm.proxyPoolLimitMode === 'account'" :span="6">
+              <el-form-item label="每账号 IP 倍率">
+                <el-input-number v-model="settingsForm.proxyPoolPerAccount" :min="1" :max="50" />
+              </el-form-item>
+            </el-col>
+            <el-col v-else :span="6">
+              <el-form-item label="固定池上限">
+                <el-input-number v-model="settingsForm.proxyPoolFixedLimit" :min="1" :max="5000" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="6">
+              <el-form-item label="num 参数模式">
+                <el-select v-model="settingsForm.proxyNumMode">
+                  <el-option label="按需自动计算" value="auto" />
+                  <el-option label="固定值" value="fixed" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col v-if="settingsForm.proxyNumMode === 'fixed'" :span="6">
+              <el-form-item label="num 固定值">
+                <el-input-number v-model="settingsForm.proxyNumFixed" :min="1" :max="1000" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="6"><el-form-item label="测活间隔 ms"><el-input-number v-model="settingsForm.proxyCheckIntervalMs" :min="1000" :max="600000" /></el-form-item></el-col>
+            <el-col :span="6"><el-form-item label="IP 最大存活 ms"><el-input-number v-model="settingsForm.proxyMaxAgeMs" :min="5000" :max="600000" /></el-form-item></el-col>
+            <el-col :span="6"><el-form-item label="低水位阈值"><el-input-number v-model="settingsForm.proxyPoolLowWatermark" :min="1" :max="500" /></el-form-item></el-col>
+            <el-col :span="6"><el-form-item label="并发提取线程"><el-input-number v-model="settingsForm.proxyFetchConcurrency" :min="1" :max="50" /></el-form-item></el-col>
+            <el-col :span="6"><el-form-item label="返回格式"><el-select v-model="settingsForm.proxyPoolFormat"><el-option label="每行一个" value="line" /><el-option label="JSON 数组" value="json" /></el-select></el-form-item></el-col>
+            <el-col :span="12"><el-form-item label="测活目标 URL"><el-input v-model="settingsForm.proxyCheckUrl" /></el-form-item></el-col>
+          </el-row>
+          <el-form-item label="代理池状态">
+            <div class="pool-stats">
+              <el-tag :type="proxyPoolStats?.alive > 0 ? 'success' : 'info'">
+                存活 {{ proxyPoolStats?.alive || 0 }}
+              </el-tag>
+              <el-tag type="info">池内 {{ proxyPoolStats?.total || 0 }} / 上限 {{ proxyPoolStats?.max_size || 0 }}</el-tag>
+              <el-tag type="info">累计提取 {{ proxyPoolStats?.fetched_total || 0 }}</el-tag>
+              <el-tag type="warning">已消耗 {{ proxyPoolStats?.discarded_total || 0 }}</el-tag>
+              <el-button size="small" @click="loadProxyPoolStats">刷新状态</el-button>
+              <el-button size="small" @click="fetchProxyPool">立即补充</el-button>
+              <el-button size="small" type="danger" plain @click="clearProxyPool">清空池</el-button>
+            </div>
+            <div v-if="proxyPoolStats?.last_fetch_error" class="pool-error">
+              最近提取错误：{{ proxyPoolStats.last_fetch_error }}
+            </div>
+          </el-form-item>
+        </template>
+      </el-form>
+
       <el-divider content-position="left">全局操作</el-divider>
       <div class="toolbar">
         <el-button
@@ -591,17 +831,17 @@ onUnmounted(() => {
         />
         <div class="batch-progress-text">
           <template v-if="progress?.running">
-            批量准备中：{{ progress.completed }}/{{ progress.total }} · 成功
+            {{ progressKindLabel }}中：{{ progress.completed }}/{{ progress.total }} · 成功
             {{ progress.succeeded }} · 失败 {{ progress.failed }} ·
             {{ progressPercent }}%
           </template>
           <template v-else-if="progress?.completed > 0">
-            上次批量准备：{{ progress.completed }}/{{ progress.total }} · 成功
+            上次{{ progressKindLabel }}：{{ progress.completed }}/{{ progress.total }} · 成功
             {{ progress.succeeded }} · 失败 {{ progress.failed }} ·
             {{ progressPercent }}%
           </template>
           <template v-else
-            >暂未开始批量准备（点击「批量准备全部账号会话」后会显示进度）</template
+            >暂未开始批量任务（批量预热 / 批量准备会话 都会在此显示进度）</template
           >
         </div>
       </div>
@@ -832,7 +1072,7 @@ onUnmounted(() => {
               >准备下单会话</el-button
             >
             <el-button :loading="busy" type="warning" @click="warmupBatch">
-              批量预热（无需库存）
+              批量预热（有货更快，无货可降级）
             </el-button>
             <el-button :loading="busy" @click="wechatPrepareBatch"
             >
@@ -888,6 +1128,22 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+}
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.pool-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.pool-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #f56c6c;
 }
 .batch-progress-wrap {
   margin-top: 12px;
