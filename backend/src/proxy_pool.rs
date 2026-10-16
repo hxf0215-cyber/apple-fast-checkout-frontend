@@ -181,7 +181,8 @@ impl ProxyPool {
             if g.proxies.len() >= max_size.max(1) {
                 break;
             }
-            // 新加入的 IP 未测活，标记 alive=false（take_one 不会取用）
+            // 新加入的 IP 先标记 alive=false；take_one 仍可取用（见其注释），
+            // 测活通过后会提升优先级。
             g.proxies.entry(u.clone()).or_insert(PoolProxy {
                 url: u,
                 added_at: Instant::now(),
@@ -192,19 +193,24 @@ impl ProxyPool {
     }
 
     /// 取一个可用代理给账号使用，取出后从池中移除
-    /// 取出一个【已测活通过】的代理；没有可用 IP 时返回 None。
-    /// 注意：绝不回退到未测活的 IP，避免把不可用代理交给下单流程。
+    /// 取出一个代理（优先已测活通过的，其次未测活的）；池空时返回 None。
+    /// 允许回退到未测活的 IP：动态池存活期短，测活常来不及；
+    /// 测活目标与业务可达性不同，且下单侧有 541 换 IP 兜底。
     pub async fn take_one(&self) -> Option<String> {
         let mut g = self.inner.lock().await;
-        // 取值策略：优先「入池最久」的可用 IP（FIFO）。
-        // HashMap 的迭代顺序不确定，100+ 账号并发取用时会随机命中，
-        // 导致部分 IP 被反复使用、部分闲置。按入池时间排序可让 IP 轮转均匀，
-        // 同时优先消耗即将到期的 IP（更符合「用完即弃」的语义）。
+        // 取值策略：优先入池最久的 IP（FIFO），让轮转均匀、优先消耗即将到期的。
+        //
+        // 【重要】允许取用「未测活 / 测活失败」的 IP：
+        //  - 动态池 IP 存活期很短，等测活完成往往已经错过抢购窗口；
+        //  - 测活目标（如 baidu）与实际业务（apple）网络可达性不同，
+        //    测活失败不代表对 Apple 不可用；
+        //  - 下单侧本就有 541 自动换 IP 的兜底，坏 IP 会被快速淘汰。
+        // 排序：已测活的优先，未测活的次之，保证永远拿得到 IP。
         let key = g
             .proxies
             .iter()
-            .filter(|(_, p)| p.alive)
-            .min_by_key(|(_, p)| p.added_at)
+            // (alive, added_at)：false 排在 true 之后，但两者都可取
+            .min_by_key(|(_, p)| (p.alive, p.added_at))
             .map(|(k, _)| k.clone())?;
         g.proxies.remove(&key).map(|p| {
             g.discarded_total += 1;
@@ -215,7 +221,7 @@ impl ProxyPool {
     /// 按需测活：只探测「必须验证」的代理，其余跳过以省流量与 CPU。
     ///
     /// 需要探测的条件（任一命中）：
-    /// - 从未测过（新入池，不测不允许取用）
+    /// - 从未测过（新入池，测活通过后提升取用优先级）
     /// - 上次探测失败（给一次复活机会）
     /// - 距过期不足 refresh_before_ms（确认剩余有效期内仍可用）
     /// 其余健康且离过期还早的 IP 直接复用上次结果。

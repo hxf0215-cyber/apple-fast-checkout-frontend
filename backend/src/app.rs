@@ -6617,29 +6617,27 @@ async fn run_watch_for_account(
     let mut setup_round: u64 = 0;
     let mut snapshot: Value;
 
-    // ---- 阶段 1：建结账态（失败按 interval 重试，不中断） ----
+    // ---- 阶段 1：建结账态 ----
+    // 注意：建态**永不放弃**。
+    // watch_max_refresh 只约束「刷新轮数」，不约束建态重试次数：
+    // 建态失败通常只是临时的（541 限流 / 会话过期 / 网络抖动），
+    // 放弃账号等于永久丢失这个账号的抢购资格，因此这里无限重试。
+    // 每轮间隔 interval_ms（541 时换代理后立即重试）。
     loop {
         setup_round += 1;
-        if max_refresh > 0 && setup_round > max_refresh {
+        // 前 3 轮每次都记，之后每 10 轮记一次，避免长时间刷屏
+        if setup_round <= 3 || setup_round % 10 == 0 {
             state
                 .log(
                     &account_id,
-                    "warn",
-                    format!("watch 建态重试已达上限 {max_refresh} 次，放弃该账号"),
+                    "info",
+                    format!(
+                        "watch 建立结账态（第 {setup_round} 次）：{part} · {store}（出口 {}）",
+                        display_proxy(&proxy)
+                    ),
                 )
                 .await;
-            return;
         }
-        state
-            .log(
-                &account_id,
-                "info",
-                format!(
-                    "watch 建立结账态：{part} · {store}（出口 {}）",
-                    display_proxy(&proxy)
-                ),
-            )
-            .await;
         let result = run_wechat_bridge(json!({
             "mode": "watch-setup",
             "cookie": account.wechat_cookie,
@@ -6711,12 +6709,14 @@ async fn run_watch_for_account(
     let mut rounds: u64 = 0;
     loop {
         rounds += 1;
+        // 刷新轮数上限由 watch_max_refresh 控制（0 = 不限）。
+        // 注意：这只影响刷新，不影响建态（建态永不放弃）。
         if max_refresh > 0 && rounds > max_refresh {
             state
                 .log(
                     &account_id,
                     "info",
-                    format!("watch 达到最大刷新次数 {max_refresh}，停止该账号守候"),
+                    format!("watch 达到刷新上限 {max_refresh} 轮，该账号结束守候（可在设置中调大或设为 0 不限）"),
                 )
                 .await;
             return;
