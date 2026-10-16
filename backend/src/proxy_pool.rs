@@ -205,12 +205,14 @@ impl ProxyPool {
         //  - 测活目标（如 baidu）与实际业务（apple）网络可达性不同，
         //    测活失败不代表对 Apple 不可用；
         //  - 下单侧本就有 541 自动换 IP 的兜底，坏 IP 会被快速淘汰。
-        // 排序：已测活的优先，未测活的次之，保证永远拿得到 IP。
+        // 排序键 (-alive, added_at)：已测活的优先，未测活的次之；
+        // 同档内按入池时间 FIFO，保证永远拿得到 IP 且轮转均匀。
+        // 注意：bool 的 Ord 是 false < true，直接用 (alive, ..) 会变成
+        // 「未测活优先」，与设计意图相反，因此这里取反。
         let key = g
             .proxies
             .iter()
-            // (alive, added_at)：false 排在 true 之后，但两者都可取
-            .min_by_key(|(_, p)| (p.alive, p.added_at))
+            .min_by_key(|(_, p)| (!p.alive, p.added_at))
             .map(|(k, _)| k.clone())?;
         g.proxies.remove(&key).map(|p| {
             g.discarded_total += 1;
@@ -434,27 +436,77 @@ fn normalize_proxy(raw: &str) -> String {
     }
 }
 
+/// 小程序 CDN 边缘域名。测活 URL 若指向 web.mmap.apple.com，
+/// 会自动改写成 CDN 域名并覆写 Host —— 这样测出来的才是真实下单出口质量。
+/// 实测该 CDN 证书主体为 apple-shield.apple.com，需跳过证书校验。
+const CDN_ORIGIN_HOST: &str = "web.mmap.apple.com";
+const CDN_EDGE_HOST: &str = "apne1b.mobileapp.prod.v.aaplimg.com";
+
+/// 把 web.mmap.apple.com 的测活 URL 改写成 CDN 域名；返回 (请求 URL, 可选 Host 覆写)。
+fn rewrite_check_url(check_url: &str) -> (String, Option<&'static str>) {
+    if check_url.contains(CDN_ORIGIN_HOST) {
+        (
+            check_url.replace(CDN_ORIGIN_HOST, CDN_EDGE_HOST),
+            Some(CDN_ORIGIN_HOST),
+        )
+    } else {
+        (check_url.to_string(), None)
+    }
+}
+
 /// 用给定代理访问 check_url，判断是否可用
 async fn probe_proxy(proxy_url: &str, check_url: &str, timeout_ms: u64) -> bool {
     let proxy = match reqwest::Proxy::all(proxy_url) {
         Ok(p) => p,
         Err(_) => return false,
     };
+    let (request_url, host_override) = rewrite_check_url(check_url);
     let client = match reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_millis(timeout_ms.max(1000)))
         .connect_timeout(Duration::from_millis(timeout_ms.max(1000)))
+        // CDN 域名证书主体不匹配，必须跳过校验；服务端按 Host 路由。
+        .danger_accept_invalid_certs(true)
         .build()
     {
         Ok(c) => c,
         Err(_) => return false,
     };
-    matches!(client.get(check_url).send().await, Ok(r) if r.status().is_success() || r.status().is_redirection())
+    let mut req = client.get(&request_url);
+    if let Some(host) = host_override {
+        req = req.header(reqwest::header::HOST, host);
+    }
+    matches!(req.send().await, Ok(r) if r.status().is_success() || r.status().is_redirection())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_check_url_maps_mmap_to_cdn() {
+        let (url, host) = rewrite_check_url(
+            "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=X&stores=R1",
+        );
+        assert_eq!(host, Some("web.mmap.apple.com"));
+        assert!(url.starts_with("https://apne1b.mobileapp.prod.v.aaplimg.com/"));
+        // path/query 必须原样保留
+        assert!(url.contains("/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=X&stores=R1"));
+    }
+
+    #[test]
+    fn rewrite_check_url_leaves_other_hosts_untouched() {
+        let (url, host) = rewrite_check_url("https://www.apple.com.cn/");
+        assert_eq!(url, "https://www.apple.com.cn/");
+        assert_eq!(host, None);
+    }
+
+    #[test]
+    fn rewrite_check_url_is_idempotent_on_cdn_host() {
+        let (url, host) = rewrite_check_url("https://apne1b.mobileapp.prod.v.aaplimg.com/x");
+        assert_eq!(url, "https://apne1b.mobileapp.prod.v.aaplimg.com/x");
+        assert_eq!(host, None);
+    }
 
     #[test]
     fn replace_query_param_rewrites_num() {
@@ -482,20 +534,43 @@ mod tests {
     }
 
     /// 按需测活的核心不变量：
-    /// 新入池的 IP 必须被标记为「未测活」，因此不会被 take_one 取走。
+    /// 新入池的 IP 标记为「未测活 + alive=false」，但仍可被 take_one 取用
+    /// （动态 IP 存活期极短，等测活会错过抢购窗口；下单侧有 541 换 IP 兜底）。
     #[tokio::test]
-    async fn new_proxy_starts_unchecked_and_unavailable() {
+    async fn new_proxy_starts_unchecked_but_takeable() {
         let pool = ProxyPool::new();
         pool.add(vec!["1.2.3.4:8080".to_string()], 10).await;
 
-        let g = pool.inner.lock().await;
-        let p = g.proxies.get("http://1.2.3.4:8080").expect("已入池");
-        assert!(!p.alive, "新入池不能直接标记为可用");
-        assert!(p.last_checked_at.is_none(), "新入池必须是未测活状态");
-        drop(g);
+        {
+            let g = pool.inner.lock().await;
+            let p = g.proxies.get("http://1.2.3.4:8080").expect("已入池");
+            assert!(!p.alive, "新入池不能直接标记为可用");
+            assert!(p.last_checked_at.is_none(), "新入池必须是未测活状态");
+        }
 
-        // 未测活 → 不允许取用（避免把不可用代理交给下单流程）
-        assert!(pool.take_one().await.is_none());
+        // 未测活也允许取用，且取走后从池中移除（用完即弃）
+        assert_eq!(pool.take_one().await.as_deref(), Some("http://1.2.3.4:8080"));
+        assert_eq!(pool.total_count().await, 0);
+    }
+
+    /// 已测活的 IP 必须优先于未测活的 IP 被取走。
+    #[tokio::test]
+    async fn alive_proxy_preferred_over_unchecked() {
+        let pool = ProxyPool::new();
+        pool.add(
+            vec!["1.1.1.1:1".to_string(), "2.2.2.2:2".to_string()],
+            10,
+        )
+        .await;
+        {
+            let mut g = pool.inner.lock().await;
+            // 让 2.2.2.2 变成「已测活且健康」，1.1.1.1 保持未测活
+            if let Some(p) = g.proxies.get_mut("http://2.2.2.2:2") {
+                p.alive = true;
+                p.last_checked_at = Some(Instant::now());
+            }
+        }
+        assert_eq!(pool.take_one().await.as_deref(), Some("http://2.2.2.2:2"));
     }
 
     /// 过期项必须被剔除，且不会因「跳过探测」而残留。

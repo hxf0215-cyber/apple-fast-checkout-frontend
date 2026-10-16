@@ -12,7 +12,27 @@ use tokio::task::JoinSet;
 use crate::models::{AccountConfig, CookieMap, GlobalSettings};
 
 const MALL: &str = "https://www.apple.com.cn";
+/// 原始域名（所有请求的 Host 头保持这个，服务端按 Host 路由）
 const MMAP: &str = "https://web.mmap.apple.com/26.07.0-MAIN";
+/// Apple CDN 边缘节点域名。
+///
+/// 实测：DNS → 17.8.132.10/113/132；证书主体是 apple-shield.apple.com
+/// （**不含** web.mmap.apple.com），因此必须同时：
+///   ① 关闭 TLS 证书校验
+///   ② 请求头 Host 覆写为 web.mmap.apple.com
+const MMAP_HOST: &str = "web.mmap.apple.com";
+
+/// CDN 域名的 host 部分（用于替换）。
+const MMAP_HOST_CDN: &str = "apne1b.mobileapp.prod.v.aaplimg.com";
+
+/// 把请求 URL 里的原始域名替换成 CDN 域名（path/query 不变）。
+fn rewrite_to_cdn(url: &str) -> String {
+    if url.contains(MMAP_HOST) {
+        url.replace(MMAP_HOST, MMAP_HOST_CDN)
+    } else {
+        url.to_string()
+    }
+}
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0";
 const SEC_UA: &str = r#""Chromium";v="154", "Microsoft Edge";v="154", "Not A(Brand";v="99""#;
 pub const APPLE_CDN_IPS: &[&str] = &[
@@ -80,6 +100,9 @@ impl AppleClient {
             .pool_max_idle_per_host(32)
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true)
+            // 走 CDN 域名时其证书主体为 apple-shield.apple.com，
+            // 无法通过标准校验；服务端按 Host 头路由，故关闭证书校验。
+            .danger_accept_invalid_certs(true)
             .cookie_provider(jar.clone());
 
         if !proxy_url.trim().is_empty() {
@@ -132,10 +155,14 @@ impl AppleClient {
         city: &str,
         district: &str,
     ) -> Result<Vec<String>> {
-        let url = format!("{MMAP}/miniprogram/retailapp/p/wechat/stores/storesFederatedSearch");
+        // 走 CDN（同库存查询）
+        let url = rewrite_to_cdn(&format!(
+            "{MMAP}/miniprogram/retailapp/p/wechat/stores/storesFederatedSearch"
+        ));
         let response = self
             .client
             .get(url)
+            .header(header::HOST, MMAP_HOST)
             .query(&[
                 ("state", province),
                 ("city", city),
@@ -180,12 +207,16 @@ impl AppleClient {
     }
 
     async fn mmap_stock_details_chunk(&self, part: &str, stores: &[String]) -> Result<Vec<Value>> {
-        let url = format!("{MMAP}/miniprogram-merch/p/wechat/product-locator/quotes");
+        // 走 CDN（与门店查询一致）：URL 换 CDN 域名，Host 头保持原域名。
+        let url = rewrite_to_cdn(&format!(
+            "{MMAP}/miniprogram-merch/p/wechat/product-locator/quotes"
+        ));
         let store_list = stores.join(",");
         let response = self
             .client
             .get(url)
             .query(&[("pn", part), ("stores", store_list.as_str())])
+            .header(header::HOST, MMAP_HOST)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -273,9 +304,16 @@ impl AppleClient {
         body: Option<&str>,
         headers: Option<Vec<(&str, &str)>>,
     ) -> Result<(u16, String)> {
+        // 走 CDN：把 URL 里的原始域名换成 CDN 域名，
+        // 同时 Host 头覆写回原始域名（服务端按 Host 路由）。
+        let cdn_url = rewrite_to_cdn(url);
+        let is_mmap = url.contains("web.mmap.apple.com");
         let mut req = self
             .client
-            .request(Method::from_bytes(method.to_uppercase().as_bytes())?, url);
+            .request(Method::from_bytes(method.to_uppercase().as_bytes())?, &cdn_url);
+        if is_mmap {
+            req = req.header(header::HOST, MMAP_HOST);
+        }
         req = req.header(header::COOKIE, self.cookie_header());
         req = req
             .header(

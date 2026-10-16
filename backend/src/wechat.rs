@@ -10,6 +10,19 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Apple CDN 边缘节点域名。
+///
+/// 实测：
+///  - DNS：apne1b.mobileapp.prod.v.aaplimg.com → 17.8.132.10/113/132
+///  - 证书：apple-shield.apple.com（**不含** web.mmap.apple.com），
+///    直连该域名会 SNI 校验失败，因此必须同时：
+///      ① 关闭 TLS 证书校验（build_wechat_client 的 danger_accept_invalid_certs）
+///      ② 请求头 Host 覆写为 web.mmap.apple.com（服务端按 Host 路由）
+const CDN_HOST: &str = "apne1b.mobileapp.prod.v.aaplimg.com";
+/// 原始域名：URL 里的 web.mmap.apple.com 会替换成 CDN_HOST，
+/// 同时 Host 头改回 ORIGIN_HOST 以通过服务端路由。
+const ORIGIN_HOST: &str = "web.mmap.apple.com";
+
 /// Apple 小程序初始化接口：领取会话指纹 Cookie `masts`（缺它时购物类接口会 302 到 covers.html/npip）。
 const INIT: &str =
     "https://web.mmap.apple.com/miniprogram-merch/p/wechat/init";
@@ -73,7 +86,12 @@ fn build_wechat_client(proxy: Option<Proxy>) -> Result<Client> {
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(64)
         .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true);
+        .tcp_nodelay(true)
+        // 走 CDN 域名（apne1b.mobileapp.prod.v.aaplimg.com）时，其证书主体是
+        // apple-shield.apple.com，不含 web.mmap.apple.com，无法通过标准校验。
+        // 因此关闭证书校验；服务端按 Host 头路由，仍会正常处理请求。
+        // 注意：这依赖 Host 头被正确覆写为 web.mmap.apple.com。
+        .danger_accept_invalid_certs(true);
     // 注意：这里不禁用自动解压。Apple 的响应仍可能带 Content-Encoding: gzip，
     // 关掉解压会拿到压缩字节、JSON 解析直接失败。每个请求会显式声明
     // Accept-Encoding: zstd，reqwest 不会再用自己的默认值覆盖它。
@@ -281,6 +299,12 @@ impl WeChatFlow {
         body: Option<&str>,
         checkout_headers: bool,
     ) -> Result<Value> {
+        // 走 CDN：把 URL 里的 web.mmap.apple.com 换成 CDN 域名，
+        // 同时请求头 Host 覆写回 web.mmap.apple.com（服务端按 Host 路由）。
+        let cdn_url = rewrite_to_cdn(url);
+        // 注意：不要把 url 重新绑定成 CDN 域名——后面还要用它和 INIT 比较、
+        // 以及记录步骤 URL。请求本身统一用 request_url。
+        let request_url: &str = &cdn_url;
         let started = Instant::now();
         // 541 是 Apple 的限流信号，退避要足够长才有机会恢复
         let retry_delays_ms = [3_000, 8_000, 15_000];
@@ -290,13 +314,15 @@ impl WeChatFlow {
             // masts 是 Apple 签发的会话指纹，缺它时购物类接口可能被判为异常客户端。
             // 每个流程只尝试领取一次；Apple 未下发属正常情况，继续走原请求。
             self.ensure_masts_once().await;
-            let mut request = self.client.request(method.clone(), url);
+            let mut request = self.client.request(method.clone(), request_url);
             // 只声明 zstd —— 实测声明 gzip 会被 Apple 判定为异常客户端，
             // 直接返回 302 到 covers.html（x-ma-covers: npip）拦截页。
             // 注意：不能改成"不发"，因为 reqwest 在 build 时会自动补 gzip。
             request = request.header("Accept-Encoding", "zstd");
             request = request.header("Accept", "application/json, text/plain, */*");
             request = request.header("Connection", "keep-alive");
+            // Host 必须保持原始域名（CDN 证书不匹配，靠 Host 路由）
+            request = request.header(reqwest::header::HOST, ORIGIN_HOST);
             request = request.header("Accept-Language", "zh-CN,zh-Hans;q=0.9");
             request = request.header(
                 "Referer",
@@ -569,12 +595,15 @@ impl WeChatFlow {
     /// 避免 request_json → refresh_masts → request_json 的递归。
     /// 返回 true 表示本次拿到了 masts。
     async fn refresh_masts(&mut self) -> Result<bool> {
+        // 同样走 CDN + Host 覆写
+        let cdn_init = rewrite_to_cdn(INIT);
         let request = self
             .client
-            .request(Method::GET, INIT)
+            .request(Method::GET, &cdn_init)
             .header("Accept-Encoding", "zstd")
             .header("Accept", "application/json, text/plain, */*")
             .header("Connection", "keep-alive")
+            .header(reqwest::header::HOST, ORIGIN_HOST)
             .header("Accept-Language", "zh-CN,zh-Hans;q=0.9")
             .header(
                 "Referer",
@@ -1761,6 +1790,17 @@ impl WeChatFlow {
 /// Apple 会对某些网络环境或时间段把接口 302 到 `/wow-assets/covers.html`，
 /// 页面里带有 `x-ma-covers: npip`（no proxy/受限 IP）标记，返回的是 HTML 而非 JSON。
 /// 识别出来可以给出准确提示，避免被误判成「购物袋为空」。
+/// 把 Apple 原始域名替换成 CDN 边缘节点域名。
+///
+/// 只替换 host 部分，path/query 原样保留；非 Apple 域名的 URL 原样返回。
+fn rewrite_to_cdn(url: &str) -> String {
+    if url.contains(ORIGIN_HOST) {
+        url.replace(ORIGIN_HOST, CDN_HOST)
+    } else {
+        url.to_string()
+    }
+}
+
 fn is_apple_cover_page(text: &str) -> bool {
     let lower = text.to_lowercase();
     // covers.html 是 Apple 的拦截/等待页特征

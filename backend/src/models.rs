@@ -286,7 +286,10 @@ fn default_proxy_fetch_concurrency() -> usize {
     5
 }
 fn default_proxy_check_url() -> String {
-    "https://www.apple.com.cn".to_string()
+    // 指向真实下单链路经过的 CDN 域名（probe_proxy 会自动改写为边缘域名并覆写 Host），
+    // 这样测活结果直接反映能否正常下单，而不是能否打开官网首页。
+    // 注意：www.apple.com.cn 首页对匿名请求会返回 541，不适合做测活目标。
+    "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=MJT74CH%2FA&stores=R480".to_string()
 }
 fn default_proxy_pool_format() -> String {
     "line".to_string()

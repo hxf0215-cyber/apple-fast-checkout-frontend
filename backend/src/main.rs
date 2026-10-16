@@ -255,6 +255,7 @@ async fn main() {
         .route("/api/watch/start", post(app::api_watch_start))
         .route("/api/watch/stop", post(app::api_watch_stop))
         .route("/api/watch/status", get(app::api_watch_status))
+        .route("/api/watch/dump", get(app::api_watch_dump))
         .route("/api/proxy/test", post(app::api_proxy_test))
         .route("/api/proxy-pool/stats", get(app::api_proxy_pool_stats))
         .route("/api/proxy-pool/clear", post(app::api_proxy_pool_clear))

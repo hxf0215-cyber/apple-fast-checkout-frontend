@@ -376,6 +376,8 @@ struct Inner {
     state_broadcast: tokio::sync::broadcast::Sender<String>,
     /// 动态代理池
     proxy_pool: ProxyPool,
+    /// watch 各账号的快照（含 line_item_id），用于调试导出
+    watch_snapshots: Mutex<HashMap<String, Value>>,
     /// 账号 → 当前分配的代理（静态或动态）
     account_proxy_assign: Mutex<HashMap<String, String>>,
     /// 静态 IP 的稳定映射：与动态池分配分开存储，停止监控时不清理，
@@ -1247,6 +1249,7 @@ impl AppState {
                     tx
                 },
                 proxy_pool: ProxyPool::new(),
+                watch_snapshots: Mutex::new(HashMap::new()),
                 account_proxy_assign: Mutex::new(HashMap::new()),
                 static_proxy_assign: Mutex::new(HashMap::new()),
             }),
@@ -6674,18 +6677,29 @@ async fn run_watch_for_account(
                     ),
                 )
                 .await;
+            // 记录快照（调试导出用）
+            state
+                .inner
+                .watch_snapshots
+                .lock()
+                .await
+                .insert(account_id.clone(), snapshot.clone());
             break;
         }
-        // 建态失败：541 时换出口后立刻重试，其它错误等 interval 再试
+        // 建态失败：
+        //   541（限流）或网络错误 → 换出口后立即重试（自愈）
+        //   其它错误（如 cookie 失效）→ 等 interval 再试
         let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-        if is_rate_limit_error(err) {
+        let need_switch = is_rate_limit_error(err) || is_network_error(err);
+        if need_switch {
             if let Some(next) = state.switch_proxy_on_rate_limit(&account_id, &proxy).await {
                 state
                     .log(
                         &account_id,
                         "warn",
                         format!(
-                            "watch 建态遇 541，切换代理：{} → {}，立即重试",
+                            "watch 建态失败（{}），切换代理：{} → {}，立即重试",
+                            if is_rate_limit_error(err) { "541 限流" } else { "网络错误" },
                             display_proxy(&proxy),
                             display_proxy(&next),
                         ),
@@ -6734,15 +6748,17 @@ async fn run_watch_for_account(
         .await;
         if result.get("ok") != Some(&json!(true)) {
             let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-            // 541 → 换出口；换不到也继续守候
-            if is_rate_limit_error(err) {
+            // 541（限流）或网络错误 → 换出口自愈；换不到也继续守候
+            let need_switch = is_rate_limit_error(err) || is_network_error(err);
+            if need_switch {
                 if let Some(next) = state.switch_proxy_on_rate_limit(&account_id, &proxy).await {
                     state
                         .log(
                             &account_id,
                             "warn",
                             format!(
-                                "watch 刷新遇 541，切换代理：{} → {}（保留结账态继续守候）",
+                                "watch 刷新失败（{}），切换代理：{} → {}（保留结账态继续守候）",
+                                if is_rate_limit_error(err) { "541 限流" } else { "网络错误" },
                                 display_proxy(&proxy),
                                 display_proxy(&next),
                             ),
@@ -6756,7 +6772,7 @@ async fn run_watch_for_account(
                             &account_id,
                             "warn",
                             format!(
-                                "watch 遇 541 但暂无备用 IP（当前 {}），{}ms 后继续重试",
+                                "watch 刷新失败但暂无备用 IP（当前 {}），{}ms 后继续重试：{err}",
                                 display_proxy(&proxy),
                                 interval_ms
                             ),
@@ -6905,6 +6921,29 @@ async fn run_watch_for_account(
                 ),
             )
             .await;
+        // 每轮刷新后把最新 stk / cookies / landing 写回快照（调试导出用，
+        // 也保证 quick-retry 用到的 snapshot 是最新的）
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert(
+                "stk".to_string(),
+                result.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+            );
+            obj.insert(
+                "cookies".to_string(),
+                result.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+            );
+            obj.insert(
+                "landing".to_string(),
+                result.pointer("/result/landing").cloned().unwrap_or(json!({})),
+            );
+        }
+        state
+            .inner
+            .watch_snapshots
+            .lock()
+            .await
+            .insert(account_id.clone(), snapshot.clone());
+
         if !has_real_slot {
             // 方案 C 第 2 步：有 timeSlot 节点但还没时段（库存刚放/时段未生成/被抢完）
             // → 不退回去等整轮，而是短间隔快速重试，抓住时段刚生成的那一刻。
@@ -7090,9 +7129,12 @@ async fn run_watch_for_account(
             }
             return; // 该账号下单完成，任务结束
         }
-        // 下单失败：541 换出口，保留守候继续下一轮
+        // 下单失败：
+        //   541（限流）或网络错误 → 换出口，保留结账态下一轮重试提交
+        //   其它错误（业务拒绝等）→ 留档 + 记录错误
         let err = finish.get("error").and_then(Value::as_str).unwrap_or("未知错误");
-        if is_rate_limit_error(err) {
+        let need_switch = is_rate_limit_error(err) || is_network_error(err);
+        if need_switch {
             let order_ms = order_started.elapsed().as_millis();
             if let Some(next) = state.switch_proxy_on_rate_limit(&account_id, &proxy).await {
                 state
@@ -7100,7 +7142,8 @@ async fn run_watch_for_account(
                         &account_id,
                         "warn",
                         format!(
-                            "watch 下单遇 541，切换代理：{} → {}（保留结账态，耗时 {order_ms}ms，下一轮重试提交）",
+                            "watch 下单失败（{}），切换代理：{} → {}（保留结账态，耗时 {order_ms}ms，下一轮重试提交）",
+                            if is_rate_limit_error(err) { "541 限流" } else { "网络错误" },
                             display_proxy(&proxy),
                             display_proxy(&next),
                         ),
@@ -7218,6 +7261,28 @@ pub async fn api_watch_start(
     Json(json!({"ok": true, "accounts": account_count, "interval_ms": interval_ms})).into_response()
 }
 /// 停止 watch 模式
+/// 【临时调试】导出当前 watch 各账号的快照（含 line_item_id / cookies / store）
+/// 用于抓取可直接复用的刷新请求体。
+pub async fn api_watch_dump(State(state): State<AppState>) -> impl IntoResponse {
+    let pools = state.inner.watch_snapshots.lock().await;
+    let list: Vec<Value> = pools
+        .iter()
+        .map(|(id, snap)| {
+            json!({
+                "account_id": id,
+                "line_item_id": snap.get("line_item_id").cloned().unwrap_or(json!(null)),
+                "store": snap.get("store").cloned().unwrap_or(json!(null)),
+                "part": snap.get("part").cloned().unwrap_or(json!(null)),
+                "proxy_url": snap.get("proxy_url").cloned().unwrap_or(json!(null)),
+                "stk": snap.get("stk").cloned().unwrap_or(json!(null)),
+                "session_id": snap.get("session_id").cloned().unwrap_or(json!(null)),
+                "cookies": snap.get("cookies").cloned().unwrap_or(json!({})),
+            })
+        })
+        .collect();
+    Json(json!({ "ok": true, "count": list.len(), "snapshots": list })).into_response()
+}
+
 pub async fn api_watch_stop(State(state): State<AppState>) -> impl IntoResponse {
     let stopped = {
         let mut handles = state.inner.handles.lock().await;
@@ -7496,26 +7561,33 @@ pub struct ProxyTestRequest {
 }
 
 /// 单个测试目标
-fn proxy_test_targets() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
-    // (类别, 名称, URL, 期望特征)
+///
+/// 小程序目标直接用 CDN 边缘域名（app 实际下单走的就是它）并覆写 Host，
+/// 这样「代理测试」反映的才是真实下单链路；Apple 官网（www.apple.com.cn）
+/// 不在该 CDN 的路由表内（实测 404），保持原域名。
+fn proxy_test_targets() -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
+    // (类别, 名称, URL, 期望特征, Host 覆写(空=不覆写))
     vec![
         (
             "后端",
             "Apple官网",
             "https://www.apple.com.cn/",
             "apple",
+            "",
         ),
         (
             "前端",
             "小程序库存",
-            "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=MJT74CH%2FA&stores=R480",
+            "https://apne1b.mobileapp.prod.v.aaplimg.com/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=MJT74CH%2FA&stores=R480",
             "mmap",
+            "web.mmap.apple.com",
         ),
         (
             "前端",
             "小程序袋子",
-            "https://web.mmap.apple.com/moe/p/wechat/chat/bag",
+            "https://apne1b.mobileapp.prod.v.aaplimg.com/moe/p/wechat/chat/bag",
             "mmap",
+            "web.mmap.apple.com",
         ),
     ]
 }
@@ -7552,6 +7624,9 @@ async fn test_one_proxy(
         .timeout(std::time::Duration::from_millis(timeout_ms))
         .connect_timeout(std::time::Duration::from_millis(timeout_ms))
         .redirect(reqwest::redirect::Policy::none())
+        // CDN 域名证书主体是 apple-shield.apple.com，需跳过校验；
+        // 服务端按 Host 头路由，Host 覆写保证仍访问到真实站点。
+        .danger_accept_invalid_certs(true)
         .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.79")
         .build()
     {
@@ -7570,9 +7645,13 @@ async fn test_one_proxy(
     let mut all_ok = true;
     let mut max_ms: u64 = 0;
 
-    for (kind, name, url, expect) in proxy_test_targets() {
+    for (kind, name, url, expect, host_override) in proxy_test_targets() {
         let started = std::time::Instant::now();
-        let result = client.get(url).send().await;
+        let mut req = client.get(url);
+        if !host_override.is_empty() {
+            req = req.header(reqwest::header::HOST, host_override);
+        }
+        let result = req.send().await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms > max_ms {
             max_ms = elapsed_ms;
