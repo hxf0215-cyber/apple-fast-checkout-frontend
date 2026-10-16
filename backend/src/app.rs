@@ -476,6 +476,10 @@ const BATCH_PREPARE_HANDLE_KEY: &str = "__batch_prepare__";
 const WATCH_HANDLE_KEY: &str = "__watch__";
 /// 每个账号的 watch 子任务句柄前缀（方案 B：账号独立循环）
 const WATCH_SUB_HANDLE_PREFIX: &str = "__watch_sub__::";
+/// 方案 C：spokes 有 timeSlot 但时段未生成时的快速重试次数
+const WATCH_SLOT_QUICK_RETRY: u32 = 5;
+/// 方案 C：快速重试间隔（毫秒）——比正常轮询更密，抢时段刚生成的那一刻
+const WATCH_SLOT_QUICK_RETRY_MS: u64 = 700;
 const BATCH_WARMUP_HANDLE_KEY: &str = "__warmup_batch__";
 const SESSION_KEEPER_HANDLE_KEY: &str = "__session_keeper__";
 const PROXY_POOL_HANDLE_KEY: &str = "__proxy_pool__";
@@ -703,6 +707,25 @@ fn is_retryable_wechat_session_error(result: &Value) -> bool {
 /// Apple 的响应/错误信息常含中文，`&s[..s.len().min(N)]` 这种写法
 /// 在截断点正好落在多字节字符中间时会直接崩掉整个请求，必须用本函数。
 /// 判断错误是否属于 Apple 限流（541）。
+/// 判断 digest 里是否包含「会话已超时」的 alert。
+///
+/// Apple 在结账态过期时返回 `alerts=[{"message":"你的操作已超时。"}]`，
+/// 此时结账态已失效，继续刷新没有意义，必须清空重建。
+///
+/// 匹配中英文与常见变体，避免文案微调导致漏判。
+fn is_session_timeout_alert(digest: &str) -> bool {
+    const KEYS: [&str; 6] = [
+        "操作已超时",
+        "会话已超时",
+        "已超时",
+        "operation timed out",
+        "session timed out",
+        "timed out",
+    ];
+    let lower = digest.to_lowercase();
+    KEYS.iter().any(|k| lower.contains(&k.to_lowercase()))
+}
+
 fn is_rate_limit_error(err: &str) -> bool {
     err.contains("541") || err.to_lowercase().contains("too many requests")
 }
@@ -757,6 +780,133 @@ fn clean_order_error(error: &str) -> String {
     } else {
         error.to_string()
     }
+}
+
+/// 把「监控命中 → 下单」的完整流程（请求 + 响应）保存到账号专属目录。
+///
+/// 目录结构：
+///   order-traces/{账号id}/{时间}_{订单号或型号@门店}.txt
+///
+/// 响应体会做「压平」处理（去换行/缩进），保证一个响应占一行，便于阅读与检索。
+///
+/// 返回值：保存的文件路径（失败时返回 Err 说明）。
+fn save_order_trace(
+    account_id: &str,
+    part: &str,
+    store: &str,
+    order_number: &str,
+    total_ms: u64,
+    trigger: &str,
+    steps: &[Value],
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+
+    let dir = std::path::Path::new("order-traces").join(safe_file_name(account_id));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // 文件名：时间_订单号（无订单号时用 型号@门店）
+    let stamp = chrono_stamp();
+    let tail = if order_number.is_empty() {
+        format!("{part}@{store}").replace(['/', ':'], "_")
+    } else {
+        order_number.to_string()
+    };
+    let file = dir.join(format!("{stamp}_{tail}.txt"));
+
+    let mut out = String::new();
+    out.push_str("========================================\n");
+    out.push_str("监控下单流程留档\n");
+    out.push_str("========================================\n");
+    out.push_str(&format!("账号    : {account_id}\n"));
+    out.push_str(&format!("型号    : {part}（{}）\n", model_display_name(part)));
+    out.push_str(&format!("门店    : {store}（{}）\n", store_display_name(store)));
+    out.push_str(&format!("订单号  : {}\n", if order_number.is_empty() { "-" } else { order_number }));
+    out.push_str(&format!("触发方式: {trigger}\n"));
+    out.push_str(&format!("总耗时  : {total_ms}ms\n"));
+    out.push_str(&format!("步骤数  : {}\n", steps.len()));
+    out.push_str(&format!("保存时间: {}\n", chrono_stamp_human()));
+    out.push_str("\n");
+
+    for (index, step) in steps.iter().enumerate() {
+        let name = step.get("name").and_then(Value::as_str).unwrap_or("-");
+        let method = step.get("method").and_then(Value::as_str).unwrap_or("-");
+        let url = step.get("url").and_then(Value::as_str).unwrap_or("-");
+        let status = step.get("status").and_then(Value::as_i64).unwrap_or(0);
+        let elapsed = step.get("elapsed_ms").and_then(Value::as_i64).unwrap_or(0);
+        let note = step.get("note").and_then(Value::as_str).unwrap_or("");
+        let body = step.get("body").and_then(Value::as_str).unwrap_or("");
+        let resp = step.get("response").and_then(Value::as_str).unwrap_or("");
+
+        out.push_str(&format!("----------------------------------------\n"));
+        out.push_str(&format!("[{}] {} {} → {}\n", index + 1, name, method, status));
+        out.push_str(&format!("URL    : {url}\n"));
+        out.push_str(&format!("耗时   : {elapsed}ms\n"));
+        if !note.is_empty() {
+            out.push_str(&format!("备注   : {note}\n"));
+        }
+        if !body.is_empty() {
+            out.push_str(&format!("请求体 : {}\n", flatten_text(body)));
+        }
+        out.push_str(&format!("响应   : {}\n", flatten_text(resp)));
+    }
+    out.push_str("========================================\n");
+
+    let mut handle = fs::File::create(&file).map_err(|e| e.to_string())?;
+    handle
+        .write_all(out.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(file)
+}
+
+/// 压平文本：JSON 用紧凑格式；其它文本把连续空白折叠成单个空格，
+/// 保证「带换行的响应」在一行内显示。
+fn flatten_text(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Ok(compact) = serde_json::to_string(&value) {
+            return compact;
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 文件名用的时间戳：YYYYMMDD_HHMMSS
+fn chrono_stamp() -> String {
+    // 用本地时间（东八区）换算
+    let now_ms = AppState::now_ms();
+    let secs = (now_ms / 1000) as i64 + 8 * 3600; // UTC+8
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // 从 1970-01-01 起算日期
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}{m:02}{d:02}_{h:02}{mi:02}{s:02}")
+}
+
+fn chrono_stamp_human() -> String {
+    let now_ms = AppState::now_ms();
+    let secs = (now_ms / 1000) as i64 + 8 * 3600;
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// 由「1970-01-01 起的第 N 天」推算年月日（Howard Hinnant 算法）
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn cookie_file_path(account_id: &str) -> std::path::PathBuf {
@@ -6508,6 +6658,7 @@ async fn run_watch_for_account(
                 "cookies": result.pointer("/result/cookies").cloned().unwrap_or(json!({})),
                 "landing": result.pointer("/result/landing").cloned().unwrap_or(json!({})),
                 "line_item_id": result.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                        "openid": result.pointer("/result/openid").cloned().unwrap_or(json!(null)),
                 "stk": result.pointer("/result/stk").cloned().unwrap_or(json!(null)),
                 "model": result.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
                 "session_id": result.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
@@ -6628,6 +6779,15 @@ async fn run_watch_for_account(
             .pointer("/result/has_time_slot")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // 方案 C：spokes 有 timeSlot 节点不算命中，必须「真的有可预约时段」
+        let has_real_slot = result
+            .pointer("/result/has_real_slot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let slot_note = result
+            .pointer("/result/slot_note")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let spokes = result
             .pointer("/result/spokes")
             .and_then(Value::as_array)
@@ -6639,29 +6799,186 @@ async fn run_watch_for_account(
             })
             .unwrap_or_default();
         let digest = result.pointer("/result/digest").and_then(Value::as_str).unwrap_or("");
+        // 会话超时：Apple 返回 alerts="你的操作已超时。"，此时结账态已失效，
+        // 必须清空重建（继续刷同一个失效的结账态没有任何意义）。
+        if is_session_timeout_alert(digest) {
+            state
+                .log(
+                    &account_id,
+                    "warn",
+                    format!("watch 会话已超时，重新建立结账态：{part} · {store}"),
+                )
+                .await;
+            // 重建需要 cookie：优先用快照里的 cookies（最新），其次回退到账号配置
+            let cookie_str = {
+                let from_snapshot = snapshot
+                    .get("cookies")
+                    .and_then(Value::as_object)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|v| format!("{k}={v}"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                if !from_snapshot.trim().is_empty() {
+                    from_snapshot
+                } else {
+                    let cfg = state.inner.config.lock().await;
+                    cfg.accounts
+                        .iter()
+                        .find(|a| a.id == account_id)
+                        .map(|a| a.wechat_cookie.clone())
+                        .unwrap_or_default()
+                }
+            };
+            // 重新走一次建态（内部会清空购物车 + 加购 + 走到 select_store）
+            let rebuild = run_wechat_bridge(json!({
+                "mode": "watch-setup",
+                "cookie": cookie_str,
+                "part": part,
+                "store": store,
+                "contact": contact,
+                "proxy": proxy,
+                "debug": false,
+            }))
+            .await;
+            if rebuild.get("ok") == Some(&json!(true)) {
+                snapshot = json!({
+                    "cookies": rebuild.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                    "landing": rebuild.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                    "line_item_id": rebuild.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                        "openid": rebuild.pointer("/result/openid").cloned().unwrap_or(json!(null)),
+                    "stk": rebuild.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                    "model": rebuild.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                    "session_id": rebuild.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                    "part": part,
+                    "store": store,
+                    "proxy_url": proxy,
+                });
+                state
+                    .log(
+                        &account_id,
+                        "info",
+                        format!("watch 结账态已重建：{part} · {store}（出口 {}）", display_proxy(&proxy)),
+                    )
+                    .await;
+            } else {
+                let e2 = rebuild
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知错误");
+                state
+                    .log(
+                        &account_id,
+                        "error",
+                        format!("watch 重建结账态失败：{e2}"),
+                    )
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            continue;
+        }
+        // 命中态：有节点但没时段时明确标注，便于区分「假命中」
+        let hit_state = if has_real_slot {
+            "命中(有时段)"
+        } else if has_slot {
+            "待时段"
+        } else {
+            "正常"
+        };
+        let slot_part = if slot_note.is_empty() {
+            String::new()
+        } else {
+            format!(" · 时段={slot_note}")
+        };
         state
             .log(
                 &account_id,
                 "info",
                 format!(
-                    "watch 第 {rounds} 轮 [{part} · {store}] 刷新 {} · timeSlot={} · spokes=[{spokes}]{}",
-                    if has_slot { "命中" } else { "正常" },
+                    "watch 第 {rounds} 轮 [{part} · {store}] 刷新 {hit_state} · timeSlot={} · spokes=[{spokes}]{slot_part}{}",
                     if has_slot { "有" } else { "无" },
                     if digest.is_empty() { String::new() } else { format!(" · {digest}") },
                 ),
             )
             .await;
-        if !has_slot {
-            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
-            continue;
+        if !has_real_slot {
+            // 方案 C 第 2 步：有 timeSlot 节点但还没时段（库存刚放/时段未生成/被抢完）
+            // → 不退回去等整轮，而是短间隔快速重试，抓住时段刚生成的那一刻。
+            if has_slot {
+                let mut got = false;
+                for attempt in 1..=WATCH_SLOT_QUICK_RETRY {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        WATCH_SLOT_QUICK_RETRY_MS,
+                    ))
+                    .await;
+                    let retry = run_wechat_bridge(json!({
+                        "mode": "watch-refresh",
+                        "cookie": "",
+                        "part": part,
+                        "store": store,
+                        "contact": contact,
+                        "state": snapshot,
+                        "proxy": proxy,
+                        "debug": false,
+                    }))
+                    .await;
+                    if retry.get("ok") != Some(&json!(true)) {
+                        continue;
+                    }
+                    snapshot = json!({
+                        "cookies": retry.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                        "landing": retry.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                        "line_item_id": retry.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                        "openid": retry.pointer("/result/openid").cloned().unwrap_or(json!(null)),
+                        "stk": retry.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                        "model": retry.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                        "session_id": retry.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                        "part": part,
+                        "store": store,
+                        "proxy_url": proxy,
+                    });
+                    let real = retry
+                        .pointer("/result/has_real_slot")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if real {
+                        state
+                            .log(
+                                &account_id,
+                                "info",
+                                format!("watch 时段就绪（快速重试第 {attempt} 次），立即下单"),
+                            )
+                            .await;
+                        got = true;
+                        break;
+                    }
+                }
+                if !got {
+                    // 快速重试仍未拿到时段，回到正常轮询节奏
+                    tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                    continue;
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                continue;
+            }
         }
 
         // ---- 阶段 3：命中，立即结账 ----
+        let order_started = std::time::Instant::now();
+        let part_label = model_display_name(&part);
+        let store_label = store_display_name(&store);
         state
             .log(
                 &account_id,
                 "info",
-                format!("watch 命中库存：{part} · {store}，立即提交订单"),
+                format!(
+                    "watch 命中库存：{part}（{part_label}） · {store}（{store_label}），立即提交订单"
+                ),
             )
             .await;
         let finish = run_wechat_bridge(json!({
@@ -6689,11 +7006,45 @@ async fn run_watch_for_account(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let order_ms = order_started.elapsed().as_millis();
+            // 留档：完整请求 + 响应（响应压平到一行）
+            if let Some(steps) = finish.get("steps").and_then(Value::as_array) {
+                match save_order_trace(
+                    &account_id,
+                    &part,
+                    &store,
+                    &order_number,
+                    order_ms as u64,
+                    "watch 命中下单（成功）",
+                    steps,
+                ) {
+                    Ok(path) => {
+                        state
+                            .log(
+                                &account_id,
+                                "info",
+                                format!("watch 流程留档：{}", path.display()),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        state
+                            .log(
+                                &account_id,
+                                "warn",
+                                format!("watch 流程留档失败：{e}"),
+                            )
+                            .await;
+                    }
+                }
+            }
             state
                 .log(
                     &account_id,
                     "info",
-                    format!("watch 下单成功：{part} · {store} · 订单 {order_number}"),
+                    format!(
+                        "watch 下单成功：{part}（{part_label}） · {store}（{store_label}） · 订单 {order_number} · 下单耗时 {order_ms}ms"
+                    ),
                 )
                 .await;
             state
@@ -6709,18 +7060,47 @@ async fn run_watch_for_account(
                     status.last_error = None;
                 })
                 .await;
+            // 落库：写入订单列表（系统总览的「下单成功账号」），
+            // 并触发订单上传。watch 之前漏了这一步，导致总览看不到订单。
+            if !order_number.is_empty() {
+                let username = {
+                    let cfg = state.inner.config.lock().await;
+                    cfg.accounts
+                        .iter()
+                        .find(|a| a.id == account_id)
+                        .map(|a| a.username.clone())
+                        .unwrap_or_else(|| account_id.clone())
+                };
+                state
+                    .persist_placed_order(&account_id, order_number.clone(), payment_link.clone())
+                    .await;
+                state
+                    .record_order(
+                        &account_id,
+                        &username,
+                        &order_number,
+                        &part,
+                        &store,
+                        finish.pointer("/summary/pickup_date").and_then(Value::as_str).unwrap_or(""),
+                        finish.pointer("/summary/pickup_time").and_then(Value::as_str).unwrap_or(""),
+                        &payment_link,
+                        order_ms as u64,
+                    )
+                    .await;
+            }
             return; // 该账号下单完成，任务结束
         }
         // 下单失败：541 换出口，保留守候继续下一轮
         let err = finish.get("error").and_then(Value::as_str).unwrap_or("未知错误");
         if is_rate_limit_error(err) {
+            let order_ms = order_started.elapsed().as_millis();
             if let Some(next) = state.switch_proxy_on_rate_limit(&account_id, &proxy).await {
                 state
                     .log(
                         &account_id,
                         "warn",
                         format!(
-                            "watch 下单遇 541，切换代理：{} → {}（保留结账态，下一轮重试提交）",
+                            "watch 下单遇 541，切换代理：{} → {}（保留结账态，耗时 {order_ms}ms，下一轮重试提交）",
                             display_proxy(&proxy),
                             display_proxy(&next),
                         ),
@@ -6730,8 +7110,33 @@ async fn run_watch_for_account(
                 snapshot["proxy_url"] = json!(proxy.clone());
             }
         } else {
+            let order_ms = order_started.elapsed().as_millis();
+            // 失败也留档：便于复现 no time slots / order not confirmed 等问题
+            if let Some(steps) = finish.get("steps").and_then(Value::as_array) {
+                if let Ok(path) = save_order_trace(
+                    &account_id,
+                    &part,
+                    &store,
+                    "",
+                    order_ms as u64,
+                    &format!("watch 命中下单（失败：{err}）"),
+                    steps,
+                ) {
+                    state
+                        .log(
+                            &account_id,
+                            "info",
+                            format!("watch 失败流程留档：{}", path.display()),
+                        )
+                        .await;
+                }
+            }
             state
-                .log(&account_id, "error", format!("watch 下单失败：{err}"))
+                .log(
+                    &account_id,
+                    "error",
+                    format!("watch 下单失败：{err} · 耗时 {order_ms}ms"),
+                )
                 .await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;

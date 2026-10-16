@@ -369,6 +369,7 @@ impl WeChatFlow {
                             format!("non-json response: {parse_err}")
                         },
                         "elapsed_ms": elapsed_ms,
+                        "response": crate::app::truncate_utf8(&text, 200_000).to_string(),
                     }));
                     if npip {
                         // 被 npip 拦截：强制重新领取一次 masts 后原样重放
@@ -429,6 +430,8 @@ impl WeChatFlow {
                 "response_type": response_type,
                 "note": note,
                 "elapsed_ms": elapsed_ms,
+                // 保存响应体（供下单流程留档），限制长度避免超大
+                "response": crate::app::truncate_utf8(&text, 200_000).to_string(),
             }));
             if status == 200 {
                 self.refresh(&value);
@@ -1360,6 +1363,10 @@ impl WeChatFlow {
         let selected = self.select_store().await?;
         self.fast = saved_fast;
         self.refresh(&selected);
+        // 预取 openID：微信支付的 openID 与具体支付方式无关（都是微信），
+        // 因此在建态时取一次缓存起来，命中下单时可省掉这一步（约 300~600ms）。
+        // 失败不影响建态（命中时会再取一次兜底）。
+        let _ = self.fetch_openid().await;
         Ok(selected)
     }
 
@@ -1418,6 +1425,46 @@ impl WeChatFlow {
         Ok((spokes, has_time_slot, data, digest))
     }
 
+    /// 探测 timeSlot 是否**真的**有可预约时段。
+    ///
+    /// 背景：spokes 里出现 `timeSlot` 节点 ≠ 有可预约时段。
+    /// 实测会遇到 spokes 有 timeSlot，但 open_time_slot 返回的 daySlots 全空
+    /// （库存刚放、时段未生成、或时段已被抢完），此时下单会报 no time slots。
+    ///
+    /// 返回 (是否有可预约时段, 概要说明)。
+    /// 注意：若 spokes 里没有 timeSlot，直接返回 (false, "no-timeSlot-spoke")。
+    pub async fn probe_time_slot_available(&mut self) -> Result<(bool, String)> {
+        let has_spoke = self
+            .spokes()
+            .iter()
+            .any(|s| s.get("id").and_then(Value::as_str) == Some("timeSlot"));
+        if !has_spoke {
+            return Ok((false, "无 timeSlot 节点".to_string()));
+        }
+        let url = self.spoke_select_url("timeSlot")?;
+        let data = self
+            .request_json("probe_time_slot", Method::GET, &url, None, true)
+            .await?;
+        let ts = data.get("timeSlot").cloned().unwrap_or(json!({}));
+        let day_slots = ts
+            .get("daySlots")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total_days = day_slots.len();
+        let days_with_slots = day_slots
+            .iter()
+            .filter(|day| {
+                day.get("timeSlots")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
+        let summary = format!("{days_with_slots}/{total_days} 天有时段");
+        Ok((days_with_slots > 0, summary))
+    }
+
     /// watch 命中后：从 timeSlot 开始把剩余结账步骤走完并提交。
     ///
     /// 前置条件：spokes 里已有 timeSlot（即库存已到货）。
@@ -1425,7 +1472,14 @@ impl WeChatFlow {
         self.save_time_slot().await?;
         self.save_pickup_contact().await?;
         self.select_wechat().await?;
-        self.fetch_openid().await?;
+        // openID 若已在建态阶段缓存则直接复用（省一步请求）。
+        // 缓存为空时才真正去取。
+        match self.openid.clone() {
+            Some(id) if !id.trim().is_empty() => {}
+            _ => {
+                self.fetch_openid().await?;
+            }
+        }
         let mut result = self.place_order().await?;
         if let Some(object) = result.as_object_mut() {
             object.insert("cookies".to_string(), json!(self.cookies));
@@ -1792,6 +1846,7 @@ pub async fn run_wechat_flow(payload: Value) -> Value {
                 "stk": flow.stk,
                 "model": flow.model,
                 "session_id": flow.session_id,
+                "openid": flow.openid,
                 "spokes": flow.spokes().iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
             })),
             Err(err) => Err(err),
@@ -1800,20 +1855,34 @@ pub async fn run_wechat_flow(payload: Value) -> Value {
             let state = payload.get("state").cloned().unwrap_or(json!({}));
             flow.restore_from_state(&state);
             match flow.refresh_pickup_checkout().await {
-            Ok((spokes, has_time_slot, _data, digest)) => Ok(json!({
-                "ok": true,
-                "has_time_slot": has_time_slot,
-                "digest": digest,
-                "spokes": spokes.iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
-                "part": flow.part,
-                "store": flow.store,
-                "line_item_id": flow.line_item_id,
-                "cookies": flow.cookies,
-                "landing": flow.landing,
-                "stk": flow.stk,
-                "model": flow.model,
-                "session_id": flow.session_id,
-            })),
+            Ok((spokes, has_time_slot, _data, digest)) => {
+                // 方案 C 第 1 步：spokes 有 timeSlot 时，进一步确认「真的有可预约时段」，
+                // 避免 spokes 有节点但 daySlots 为空导致下单报 no time slots。
+                let (has_real_slot, slot_note) = if has_time_slot {
+                    match flow.probe_time_slot_available().await {
+                        Ok((ok, note)) => (ok, note),
+                        Err(e) => (false, format!("探测失败：{e}")),
+                    }
+                } else {
+                    (false, String::new())
+                };
+                Ok(json!({
+                    "ok": true,
+                    "has_time_slot": has_time_slot,
+                    "has_real_slot": has_real_slot,
+                    "slot_note": slot_note,
+                    "digest": digest,
+                    "spokes": spokes.iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
+                    "part": flow.part,
+                    "store": flow.store,
+                    "line_item_id": flow.line_item_id,
+                    "cookies": flow.cookies,
+                    "landing": flow.landing,
+                    "stk": flow.stk,
+                    "model": flow.model,
+                    "session_id": flow.session_id,
+                }))
+            }
             Err(err) => Err(err),
             }
         },
