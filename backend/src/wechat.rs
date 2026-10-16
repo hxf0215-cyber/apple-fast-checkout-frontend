@@ -32,6 +32,11 @@ const BAG: &str = "https://web.mmap.apple.com/moe/p/wechat/chat/bag";
 const CHECKOUT_START: &str = "https://web.mmap.apple.com/moe/p/wechat/v2/chat/checkout/start";
 const FETCH_OPENID: &str =
     "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-bootstrap/fetchOpenId";
+/// 下单状态轮询地址（checkout_status）。
+/// place_order 正常时会给 302 信封里的 /head/data/url；走 CDN 时偶发直接返回
+/// session_expired 且不带信封，这里用固定地址兜底轮询，确保仍能取到订单号。
+const CHECKOUT_STATUS: &str =
+    "https://web.mmap.apple.com/moe/p/wechat/v2/checkoutx/statusx?dst=&_a=statusUrl&_m=spinner";
 const UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.79(0x18004f26) NetType/WIFI Language/zh_CN";
 const COOKIE_ORDER: &[&str] = &[
     "as_dima",
@@ -301,9 +306,18 @@ impl WeChatFlow {
     ) -> Result<Value> {
         // 走 CDN：把 URL 里的 web.mmap.apple.com 换成 CDN 域名，
         // 同时请求头 Host 覆写回 web.mmap.apple.com（服务端按 Host 路由）。
-        let cdn_url = rewrite_to_cdn(url);
+        //
+        // 【例外】下单终态（place_order / checkout_status）必须走原始域名：
+        // 实测经 CDN 边缘节点时，Apple 会在**订单已创建**的情况下直接返回
+        // session_expired，且不再返回订单号；换回原始域名后能正常拿到
+        // orderNumber（实测 W1723339864）。
         // 注意：不要把 url 重新绑定成 CDN 域名——后面还要用它和 INIT 比较、
         // 以及记录步骤 URL。请求本身统一用 request_url。
+        let cdn_url = if must_use_origin(name) {
+            url.to_string()
+        } else {
+            rewrite_to_cdn(url)
+        };
         let request_url: &str = &cdn_url;
         let started = Instant::now();
         // 541 是 Apple 的限流信号，退避要足够长才有机会恢复
@@ -1239,6 +1253,55 @@ impl WeChatFlow {
         out
     }
 
+    /// 订单确认兜底：Apple 偶发在订单**实际已创建**的情况下返回
+    /// session_expired / 不完整响应（放置成功但轮询没拿到 thank you 页）。
+    /// 此时服务端会把购物袋清空，用「目标商品已不在购物袋」反证订单已创建，
+    /// 避免把成功误报为失败（实测：place_order 报 session_expired，
+    /// 但小程序订单列表里订单已存在，购物袋 count=0）。
+    async fn confirm_order_by_bag(&mut self) -> bool {
+        // Apple 清空购物袋是**异步**的：实测 place_order 返回 session_expired 后
+        // 立即查袋仍是 count=1，过一会儿才变 count=0，而订单确实已创建。
+        // 因此这里按递增间隔轮询，避免因查得太早把成功单判成失败。
+        const DELAYS_MS: [u64; 6] = [1_500, 2_500, 3_500, 4_500, 5_500, 7_000];
+        for (idx, delay_ms) in DELAYS_MS.iter().enumerate() {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            let Ok(bag) = self.bag().await else {
+                continue;
+            };
+            let empty = bag
+                .get("isEmptyCart")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let target_gone = !bag
+                .get("lineItems")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items.iter().any(|item| {
+                        item.get("partNumber").and_then(Value::as_str)
+                            == Some(self.part.as_str())
+                    })
+                })
+                .unwrap_or(false);
+            if empty || target_gone {
+                self.steps.push(json!({
+                    "name": "order_confirm_by_bag",
+                    "method": "GET",
+                    "url": BAG,
+                    "status": 200,
+                    "response_type": "application/json",
+                    "note": format!(
+                        "第 {} 次查袋：购物袋已清空（isEmptyCart={}）→ 判定订单已创建",
+                        idx + 1,
+                        empty
+                    ),
+                    "elapsed_ms": 0,
+                }));
+                return true;
+            }
+        }
+        false
+    }
+
     async fn place_order(&mut self) -> Result<Value> {
         let url = self
             .landing
@@ -1284,6 +1347,44 @@ impl WeChatFlow {
             .unwrap_or("")
             .to_string();
         if page_type != "thankyou" || order_number.is_empty() {
+            // 兜底：Apple 有时在订单已创建的情况下返回 session_expired /
+            // 不完整响应。此时购物袋会被**异步**清空——用「目标商品已不在袋中」反证成功。
+            // 注意：confirm_order_by_bag 内部自行记录 steps 与其轮询细节。
+            if self.confirm_order_by_bag().await {
+                // 尽力补全订单号：再拉一次 status 页，Apple 在返回 thank you 页时
+                // 会把 orderNumber 放在 /model/orderNumber。取不到不影响成功判定。
+                if let Some(status_url) = result
+                    .pointer("/head/data/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                {
+                    if !status_url.is_empty() {
+                        if let Ok(status) = self
+                            .request_json("checkout_status", Method::GET, &status_url, None, true)
+                            .await
+                        {
+                            let recovered = status
+                                .pointer("/model/orderNumber")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if !recovered.is_empty() {
+                                let mut confirmed = status.clone();
+                                if let Some(object) = confirmed.as_object_mut() {
+                                    object.insert("pageType".to_string(), json!("thankyou"));
+                                    object.insert("orderConfirmedByBag".to_string(), json!(true));
+                                }
+                                return Ok(confirmed);
+                            }
+                        }
+                    }
+                }
+                let mut confirmed = result.clone();
+                if let Some(object) = confirmed.as_object_mut() {
+                    object.insert("pageType".to_string(), json!("thankyou"));
+                    object.insert("orderConfirmedByBag".to_string(), json!(true));
+                }
+                return Ok(confirmed);
+            }
             let keys = result
                 .as_object()
                 .map(|object| object.keys().cloned().collect::<Vec<_>>())
@@ -1330,9 +1431,47 @@ impl WeChatFlow {
     }
 
     async fn follow_status(&mut self, mut data: Value) -> Result<Value> {
+        // session_expired 兜底轮询：Apple 偶发在订单已创建的情况下先回一次
+        // session_expired，随后状态页仍会变成 thank you。这里多给几次机会，
+        // 避免把已成功的订单判成失败（真正的过期会在后续轮询中稳定复现）。
+        let mut session_expired_retries = 0u32;
+        const SESSION_EXPIRED_RETRIES: u32 = 5;
         for _ in 0..30 {
-            if data.get("sorryKey").is_some() {
+            let session_expired = data
+                .get("sorryKey")
+                .and_then(Value::as_str)
+                .map(|key| key.eq_ignore_ascii_case("session_expired"))
+                .unwrap_or(false);
+            if data.get("sorryKey").is_some() && !session_expired {
                 return Ok(data);
+            }
+            if session_expired {
+                // 优先用响应自带的信封地址；走 CDN 时可能既没有信封也没有订单号，
+                // 这时用固定状态地址继续轮询——下单本身多半已成功，
+                // 只是这一步的响应被替换成了过期文案。
+                let envelope_url = data
+                    .pointer("/head/data/url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let status_url = if envelope_url.is_empty() {
+                    CHECKOUT_STATUS
+                } else {
+                    envelope_url
+                };
+                if session_expired_retries >= SESSION_EXPIRED_RETRIES {
+                    return Ok(data);
+                }
+                session_expired_retries += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                match self
+                    .request_json("checkout_status", Method::GET, status_url, None, true)
+                    .await
+                {
+                    Ok(next) => data = next,
+                    // 轮询失败（如 403）时保留上一次结果，交给外层做购物袋兜底判定。
+                    Err(_) => return Ok(data),
+                }
+                continue;
             }
             if data.get("pageType").is_some() {
                 return Ok(data);
@@ -1794,11 +1933,37 @@ impl WeChatFlow {
 ///
 /// 只替换 host 部分，path/query 原样保留；非 Apple 域名的 URL 原样返回。
 fn rewrite_to_cdn(url: &str) -> String {
+    if mmap_edge_disabled() {
+        return url.to_string();
+    }
     if url.contains(ORIGIN_HOST) {
         url.replace(ORIGIN_HOST, CDN_HOST)
     } else {
         url.to_string()
     }
+}
+
+/// 必须走原始域名（web.mmap.apple.com）的步骤。
+///
+/// 只把 checkout_status 拉回原始域名：
+/// - place_order 继续走 CDN（提交本身没问题，订单确实创建成功）；
+/// - 但「查订单号」这步经 CDN 时响应被替换成 session_expired 文案，
+///   轮询拿不到 pageType=thankyou / orderNumber；换回原始域名后同一步
+///   能正常返回订单号（实测 W1723339864）。
+/// 也就是说：换回原域名只是为了「读到确切的订单结果」，不改变下单行为。
+fn must_use_origin(name: &str) -> bool {
+    matches!(name, "checkout_status")
+}
+
+/// 逃生开关：设置环境变量 AFC_MMAP_DOMAIN=origin 可临时切回原始域名
+/// （用于排查「CDN 边缘节点是否影响下单/会话」这类问题，无需重新编译）。
+fn mmap_edge_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("AFC_MMAP_DOMAIN")
+            .map(|v| v.eq_ignore_ascii_case("origin"))
+            .unwrap_or(false)
+    })
 }
 
 fn is_apple_cover_page(text: &str) -> bool {
