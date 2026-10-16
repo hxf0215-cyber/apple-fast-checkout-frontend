@@ -287,6 +287,61 @@ async function stopAll() {
   }
 }
 
+/** watch 模式：守着结账态等库存 */
+const watchRunning = ref(false);
+const watchActing = ref(false);
+
+async function refreshWatchStatus() {
+  try {
+    const r = await api.watchStatus();
+    watchRunning.value = !!r.running;
+  } catch {
+    /* 忽略：状态查询失败不影响主流程 */
+  }
+}
+
+async function startWatch() {
+  if (watchActing.value) return;
+  watchActing.value = true;
+  try {
+    await ElMessageBox.confirm(
+      "开启后会为每个账号建立一次结账态（自动清空购物车 → 加购 1 个型号 → 选好门店），" +
+        "然后持续刷新结账接口，一旦有库存立即下单。\n\n" +
+        "注意：该过程属于结账类请求，可能触发 Apple 541 限流；请配合代理使用。",
+      "开启 watch 模式",
+      { type: "warning", confirmButtonText: "开启", cancelButtonText: "取消" }
+    );
+    const result = await api.watchStart({});
+    if (!result.ok) throw new Error(result.error || "启动失败");
+    watchRunning.value = true;
+    ElMessage.success(
+      `watch 已启动：${result.accounts ?? 0} 个账号 · 刷新间隔 ${result.interval_ms ?? 0}ms`
+    );
+    await load();
+  } catch (error: any) {
+    if (!["cancel", "close"].includes(error)) {
+      ElMessage.error(error?.message || "启动 watch 失败");
+    }
+  } finally {
+    watchActing.value = false;
+  }
+}
+
+async function stopWatch() {
+  if (watchActing.value) return;
+  watchActing.value = true;
+  try {
+    await api.watchStop();
+    watchRunning.value = false;
+    ElMessage.success("watch 已停止");
+    await load();
+  } catch (error: any) {
+    ElMessage.error(error?.message || "停止 watch 失败");
+  } finally {
+    watchActing.value = false;
+  }
+}
+
 async function clearCompleted() {
   try {
     await ElMessageBox.confirm(
@@ -523,6 +578,7 @@ function exportReport() {
 }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let watchStatusTimer: ReturnType<typeof setInterval> | null = null;
 
 const { state: wsState, connected: wsConnected } = useRealtime();
 // 是否已完成首次设置同步（避免 WebSocket 推送覆盖用户正在编辑的内容）
@@ -601,6 +657,10 @@ onMounted(async () => {
   setInterval(() => {
     if (settingsForm.proxyPoolEnabled) loadProxyPoolStats();
   }, 10000);
+
+  // watch 状态：首次查询 + 5 秒轮询（后端会在跑完后自动回收句柄）
+  await refreshWatchStatus();
+  watchStatusTimer = setInterval(refreshWatchStatus, 5000);
 });
 
 watch(selectedAccountId, id => {
@@ -614,6 +674,7 @@ watch(selectedAccountId, id => {
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
+  if (watchStatusTimer) clearInterval(watchStatusTimer);
 });
 
 // 连接正常时停止轮询，仅在断线时启用（减少 CPU 与请求）
@@ -860,6 +921,50 @@ watch(
           >清空已完成状态</el-button
         >
       </div>
+
+      <el-divider content-position="left">watch 模式（守着结账态等库存）</el-divider>
+      <div class="toolbar">
+        <el-tag
+          :type="watchRunning ? 'success' : 'info'"
+          effect="dark"
+          size="large"
+          style="margin-right: 12px"
+        >
+          {{ watchRunning ? "watch 运行中" : "watch 未运行" }}
+        </el-tag>
+        <el-button
+          type="warning"
+          size="large"
+          :loading="watchActing"
+          :disabled="watchRunning"
+          @click="startWatch"
+          >开启 watch</el-button
+        >
+        <el-button
+          type="danger"
+          size="large"
+          plain
+          :loading="watchActing"
+          :disabled="!watchRunning"
+          @click="stopWatch"
+          >关闭 watch</el-button
+        >
+      </div>
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-top: 8px"
+      >
+        <template #title>
+          开启后：自动清空购物车 → 加购 1 个型号（多型号随机选一个）→ 选好门店 →
+          持续刷新结账接口；一旦出现取货时间段就立即下单。
+        </template>
+        <template #default>
+          该流程属结账类请求，可能触发 Apple 541 限流，建议配合静态 IP / 动态代理池使用。
+          刷新间隔与最大次数可在下方设置中调整（watch_interval_ms / watch_max_refresh）。
+        </template>
+      </el-alert>
       <div class="batch-progress-wrap">
         <el-progress
           :percentage="progressPercent"

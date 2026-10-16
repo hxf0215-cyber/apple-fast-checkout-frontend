@@ -1337,6 +1337,85 @@ impl WeChatFlow {
         self.complete_checkout(place).await
     }
 
+    /// 一次性建立「到店取货」结账态，停在 select_store 之后。
+    ///
+    /// 流程：prepare_cart → checkout_start → 切 RETAIL → change_store
+    ///      → check_availability → select_store
+    ///
+    /// 返回 select_store 的响应（含 spokes），供 watch 模式反复刷新。
+    /// 无货时也能执行成功（Apple 不报错），只是 spokes 里没有 timeSlot。
+    pub async fn build_pickup_checkout(&mut self) -> Result<Value> {
+        self.prepare_cart().await?;
+        if self.line_item_id.is_none() {
+            bail!("wechat cart line item missing");
+        }
+        let data = self.checkout_start().await?;
+        self.refresh(&data);
+        self.ensure_pickup_fulfillment().await?;
+        self.change_store().await?;
+        // 注意：这里显式走 check_availability（忽略 fast 标志），
+        // 因为 watch 模式需要把库存判定写进结账态。
+        let saved_fast = self.fast;
+        self.fast = false;
+        let selected = self.select_store().await?;
+        self.fast = saved_fast;
+        self.refresh(&selected);
+        Ok(selected)
+    }
+
+    /// 刷新一次结账态（重放 selectStoreUrl），返回是否已出现 timeSlot。
+    ///
+    /// Apple 在生成 spokes 时会依据库存判定：
+    ///  - 有货 → spokes 里带 timeSlot
+    ///  - 无货 → 不带
+    /// 返回 (spokes, has_time_slot, 原始响应)
+    pub async fn refresh_pickup_checkout(&mut self) -> Result<(Vec<Value>, bool, Value)> {
+        let url = self
+            .landing
+            .pointer("/pickup/selectStoreUrl")
+            .and_then(Value::as_str)
+            .unwrap_or("https://web.mmap.apple.com/moe/p/wechat/v2/checkoutx?_a=selectStoreUrl&_m=checkout.pickup")
+            .to_string();
+        let line_item_id = self.line_item_id.clone().unwrap_or_default();
+        if line_item_id.is_empty() {
+            bail!("line_item_id missing while refreshing pickup checkout");
+        }
+        let body = format!(
+            "checkout.pickup.cartLineItemId={}&checkout.pickup.currentRetailId={}",
+            urlencoding::encode(&line_item_id),
+            urlencoding::encode(&self.store)
+        );
+        let data = self
+            .request_json("refresh_pickup", Method::POST, &url, Some(&body), true)
+            .await?;
+        self.refresh(&data);
+        let spokes = self.spokes();
+        let has_time_slot = spokes.iter().any(|spoke| {
+            spoke.get("id").and_then(Value::as_str) == Some("timeSlot")
+        });
+        Ok((spokes, has_time_slot, data))
+    }
+
+    /// watch 命中后：从 timeSlot 开始把剩余结账步骤走完并提交。
+    ///
+    /// 前置条件：spokes 里已有 timeSlot（即库存已到货）。
+    pub async fn finish_checkout_after_slot(&mut self) -> Result<Value> {
+        self.save_time_slot().await?;
+        self.save_pickup_contact().await?;
+        self.select_wechat().await?;
+        self.fetch_openid().await?;
+        let mut result = self.place_order().await?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("cookies".to_string(), json!(self.cookies));
+            object.insert("timeSlotData".to_string(), self.selected_time_slot.clone());
+            object.insert("line_item_id".to_string(), json!(self.line_item_id));
+            object.insert("session_id".to_string(), json!(self.session_id));
+            object.insert("stk".to_string(), json!(self.stk));
+            object.insert("openid".to_string(), json!(self.openid));
+        }
+        Ok(result)
+    }
+
     /// 购物袋已就绪时推进结账流程直到下单。
     /// 被 run()（全流程）与「预热会话快速下单」共用：
     /// - 已有结账页数据（预热时已进入结账）则跳过 checkout_start，省一步；
@@ -1545,7 +1624,9 @@ impl WeChatFlow {
         }))
     }
 
-    pub async fn place_prepared(&mut self, state: Value) -> Result<Value> {
+    /// 从预热/结账态的 JSON 恢复 flow 内联状态。
+    /// 供 place_prepared / watch-refresh / watch-finish 共用。
+    fn restore_from_state(&mut self, state: &Value) {
         if let Some(cookies) = state.get("cookies").and_then(Value::as_object) {
             self.cookies = cookies
                 .iter()
@@ -1570,7 +1651,11 @@ impl WeChatFlow {
             .get("openid")
             .and_then(Value::as_str)
             .map(str::to_string);
-        self.landing = state.get("landing").cloned().unwrap_or(json!({}));
+        if let Some(landing) = state.get("landing") {
+            if !landing.is_null() {
+                self.landing = landing.clone();
+            }
+        }
         if let Some(proxy) = state.get("proxy_url").and_then(Value::as_str) {
             self.proxy_url = proxy.to_string();
         }
@@ -1580,6 +1665,10 @@ impl WeChatFlow {
         if let Some(store) = state.get("store").and_then(Value::as_str) {
             self.store = store.to_string();
         }
+    }
+
+    pub async fn place_prepared(&mut self, state: Value) -> Result<Value> {
+        self.restore_from_state(&state);
         // 预热会话已包含结账页数据（landing + sessionID + 购物袋）时直接下单，
         // 跳过清空购物车与加购，这是预热提速的主要来源；
         // 数据不完整（无货预热）时回退到完整结账流程，避免直接失败。
@@ -1666,6 +1755,53 @@ pub async fn run_wechat_flow(payload: Value) -> Value {
             let state = payload.get("state").cloned().unwrap_or(json!({}));
             flow.place_prepared(state).await
         }
+        // watch 模式三段式：
+        //   watch-setup   建一次结账态（清空购物车 + 加购 + 走到 select_store）
+        //   watch-refresh 反复刷新 selectStoreUrl，检查 spokes 是否出现 timeSlot
+        //   watch-finish  命中后从 timeSlot 开始走完并提交
+        "watch-setup" => match flow.build_pickup_checkout().await {
+            Ok(_v) => Ok(json!({
+                "ok": true,
+                "cookies": flow.cookies,
+                "landing": flow.landing,
+                "line_item_id": flow.line_item_id,
+                "part": flow.part,
+                "store": flow.store,
+                "stk": flow.stk,
+                "model": flow.model,
+                "session_id": flow.session_id,
+                "spokes": flow.spokes().iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
+            })),
+            Err(err) => Err(err),
+        },
+        "watch-refresh" => {
+            let state = payload.get("state").cloned().unwrap_or(json!({}));
+            flow.restore_from_state(&state);
+            match flow.refresh_pickup_checkout().await {
+            Ok((spokes, has_time_slot, _data)) => Ok(json!({
+                "ok": true,
+                "has_time_slot": has_time_slot,
+                "spokes": spokes.iter().filter_map(|s| s.get("id").cloned()).collect::<Vec<_>>(),
+                "part": flow.part,
+                "store": flow.store,
+                "line_item_id": flow.line_item_id,
+                "cookies": flow.cookies,
+                "landing": flow.landing,
+                "stk": flow.stk,
+                "model": flow.model,
+                "session_id": flow.session_id,
+            })),
+            Err(err) => Err(err),
+            }
+        },
+        "watch-finish" => {
+            let state = payload.get("state").cloned().unwrap_or(json!({}));
+            flow.restore_from_state(&state);
+            match flow.finish_checkout_after_slot().await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(err),
+            }
+        },
         _ => flow.run(place).await,
     };
     match outcome {

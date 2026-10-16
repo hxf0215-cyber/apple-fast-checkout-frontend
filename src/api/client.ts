@@ -308,6 +308,17 @@ export const api = {
       null,
       { ok: boolean; accounts?: number; sessions?: number; error?: string }
     >("/api/wechat/prepare-batch", { data }),
+  // ===== watch 模式：守着结账态等库存（建一次结账态后持续刷新 select_store） =====
+  watchStart: (data: { account_ids?: string[] }) =>
+    http.post<
+      null,
+      { ok: boolean; accounts?: number; interval_ms?: number; error?: string }
+    >("/api/watch/start", { data }),
+  watchStop: () =>
+    http.post<null, { ok: boolean; stopped?: boolean }>("/api/watch/stop"),
+  watchStatus: () =>
+    http.get<null, { ok: boolean; running: boolean }>("/api/watch/status"),
+
   queryStock: (
     id: string,
     data: {

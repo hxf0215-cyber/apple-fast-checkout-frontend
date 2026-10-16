@@ -325,6 +325,13 @@ pub struct WechatOrderRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct WatchRequest {
+    /// 要 watch 的账号；为空表示全部启用账号
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WechatPrepareBatchRequest {
     #[serde(default)]
     pub account_ids: Vec<String>,
@@ -465,6 +472,8 @@ fn display_proxy(proxy_url: &str) -> String {
 }
 const GLOBAL_MONITOR_HANDLE_KEY: &str = "__global_monitor__";
 const BATCH_PREPARE_HANDLE_KEY: &str = "__batch_prepare__";
+/// watch（守着结账态等库存）任务句柄 key
+const WATCH_HANDLE_KEY: &str = "__watch__";
 const BATCH_WARMUP_HANDLE_KEY: &str = "__warmup_batch__";
 const SESSION_KEEPER_HANDLE_KEY: &str = "__session_keeper__";
 const PROXY_POOL_HANDLE_KEY: &str = "__proxy_pool__";
@@ -6305,6 +6314,287 @@ pub async fn api_apply_account_bulk(
 pub async fn api_start(State(state): State<AppState>) -> StatusCode {
     state.start_global_monitor().await;
     StatusCode::OK
+}
+
+/// 启动 watch 模式：每个账号建立一次「到店取货」结账态，然后持续刷新 select_store，
+/// 一旦 spokes 出现 timeSlot（= 库存到货）就立即走完剩余步骤并提交。
+pub async fn api_watch_start(
+    State(state): State<AppState>,
+    Json(payload): Json<WatchRequest>,
+) -> impl IntoResponse {
+    // 先停掉上一轮 watch（若在跑）
+    if let Some(handle) = state.inner.handles.lock().await.remove(WATCH_HANDLE_KEY) {
+        handle.abort();
+    }
+
+    let accounts = {
+        let config = state.inner.config.lock().await;
+        config
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.enabled
+                    && !a.wechat_cookie.trim().is_empty()
+                    && (payload.account_ids.is_empty() || payload.account_ids.contains(&a.id))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if accounts.is_empty() {
+        return Json(json!({"ok": false, "error": "没有可用账号（需启用且有 Cookie）"})).into_response();
+    }
+
+    let settings = state.inner.config.lock().await.settings.clone();
+    let interval_ms = settings.watch_interval_ms.max(200);
+    let max_refresh = settings.watch_max_refresh;
+    let watch_state = state.clone();
+    let account_count = accounts.len();
+
+    let handle = tokio::spawn(async move {
+        // 每个账号：先建结账态（清空购物车 + 加购 1 个型号 + 走到 select_store）
+        let mut ready: Vec<(String, String, String, Value, String, Value)> = Vec::new();
+        for account in &accounts {
+            let proxy = watch_state
+                .resolve_account_proxy(account)
+                .await
+                .unwrap_or_default();
+            // 多型号时随机挑一个（用户要求：多型号随便选一个加入购物车）
+            let parts = if account.parts.is_empty() {
+                vec![account.part.clone()]
+            } else {
+                account.parts.clone()
+            };
+            let pick = if parts.len() == 1 {
+                0
+            } else {
+                use rand::Rng;
+                rand::thread_rng().gen_range(0..parts.len())
+            };
+            let part = parts[pick].clone();
+            // 联系人随快照一起传递：watch-finish 的 save_pickup_contact 需要
+            let contact = json!({
+                "lastName": account.contact.last_name,
+                "firstName": account.contact.first_name,
+                "emailAddress": account.contact.email,
+                "fullDaytimePhone": account.contact.phone,
+                "nationalId": account.contact.national_id_suffix,
+            });
+            let store = if account.store_id.trim().is_empty() {
+                account.stores.first().cloned().unwrap_or_default()
+            } else {
+                account.store_id.clone()
+            };
+            watch_state
+                .log(
+                    &account.id,
+                    "info",
+                    format!("watch 建立结账态：{part} · {store}（出口 {proxy_display}）", proxy_display = display_proxy(&proxy)),
+                )
+                .await;
+            let result = run_wechat_bridge(json!({
+                "mode": "watch-setup",
+                "cookie": account.wechat_cookie,
+                "part": part,
+                "store": store,
+                "contact": json!({
+                    "lastName": account.contact.last_name,
+                    "firstName": account.contact.first_name,
+                    "emailAddress": account.contact.email,
+                    "fullDaytimePhone": account.contact.phone,
+                    "nationalId": account.contact.national_id_suffix,
+                }),
+                "proxy": proxy,
+                "debug": false,
+            }))
+            .await;
+            if result.get("ok") == Some(&json!(true)) {
+                watch_state
+                    .persist_wechat_cookie_from_result(&account.id, &result)
+                    .await;
+                let state_snapshot = json!({
+                    "cookies": result.pointer("/result/cookies").cloned().unwrap_or(json!({})),
+                    "landing": result.pointer("/result/landing").cloned().unwrap_or(json!({})),
+                    "line_item_id": result.pointer("/result/line_item_id").cloned().unwrap_or(json!(null)),
+                    "stk": result.pointer("/result/stk").cloned().unwrap_or(json!(null)),
+                    "model": result.pointer("/result/model").cloned().unwrap_or(json!("mobileWeChatCheckout")),
+                    "session_id": result.pointer("/result/session_id").cloned().unwrap_or(json!(null)),
+                    "part": part,
+                    "store": store,
+                    "proxy_url": proxy,
+                });
+                ready.push((account.id.clone(), part.clone(), store.clone(), state_snapshot, proxy, contact));
+                watch_state
+                    .log(&account.id, "info", format!("watch 结账态就绪：{part} · {store}，开始守候 timeSlot"))
+                    .await;
+            } else {
+                let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
+                watch_state
+                    .log(&account.id, "error", format!("watch 建立结账态失败：{err}"))
+                    .await;
+            }
+        }
+
+        if ready.is_empty() {
+            watch_state.log("batch", "error", "watch 无可守候账号，任务退出").await;
+            return;
+        }
+        watch_state
+            .log(
+                "batch",
+                "info",
+                format!("watch 已启动：{}/{} 个账号就绪，刷新间隔 {interval_ms}ms", ready.len(), account_count),
+            )
+            .await;
+
+        // 持续刷新
+        let mut rounds: u64 = 0;
+        loop {
+            rounds += 1;
+            if max_refresh > 0 && rounds > max_refresh {
+                watch_state
+                    .log("batch", "info", format!("watch 达到最大刷新次数 {max_refresh}，自动停止"))
+                    .await;
+                break;
+            }
+            let mut still: Vec<(String, String, String, Value, String, Value)> = Vec::new();
+            for (account_id, part, store, state_snapshot, proxy, contact) in ready.into_iter() {
+
+                let result = run_wechat_bridge(json!({
+                    "mode": "watch-refresh",
+                    "cookie": "",
+                    "part": part,
+                    "store": store,
+                    "contact": contact,
+                    "state": state_snapshot,
+                    "proxy": proxy,
+                    "debug": false,
+                }))
+                .await;
+                if result.get("ok") != Some(&json!(true)) {
+                    let err = result.get("error").and_then(Value::as_str).unwrap_or("未知错误");
+                    watch_state
+                        .log(&account_id, "warn", format!("watch 刷新失败（跳过本轮）：{err}"))
+                        .await;
+                    still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                    continue;
+                }
+                let has_slot = result
+                    .pointer("/result/has_time_slot")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !has_slot {
+                    still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                    continue;
+                }
+                // 命中：立即结账
+                watch_state
+                    .log(&account_id, "info", format!("watch 命中库存：{part} · {store}，立即提交订单"))
+                    .await;
+                let finish = run_wechat_bridge(json!({
+                    "mode": "watch-finish",
+                    "cookie": "",
+                    "part": part,
+                    "store": store,
+                    "contact": contact,
+                    "state": state_snapshot,
+                    "proxy": proxy,
+                    "debug": false,
+                }))
+                .await;
+                if finish.get("ok") == Some(&json!(true)) {
+                    watch_state
+                        .persist_wechat_cookie_from_result(&account_id, &finish)
+                        .await;
+                    let order_number = finish
+                        .pointer("/summary/order_number")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let payment_link = finish
+                        .pointer("/summary/order_url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    watch_state
+                        .log(
+                            &account_id,
+                            "info",
+                            format!("watch 下单成功：{part} · {store} · 订单 {order_number}"),
+                        )
+                        .await;
+                    watch_state
+                        .update_status(&account_id, |status| {
+                            status.status = "order placed".to_string();
+                            status.orders_placed += 1;
+                            if !order_number.is_empty() {
+                                status.last_order_number = Some(order_number.clone());
+                            }
+                            if !payment_link.is_empty() {
+                                status.last_payment_link = Some(payment_link.clone());
+                            }
+                            status.last_error = None;
+                        })
+                        .await;
+                } else {
+                    let err = finish.get("error").and_then(Value::as_str).unwrap_or("未知错误");
+                    watch_state
+                        .log(&account_id, "error", format!("watch 下单失败：{err}"))
+                        .await;
+                    // 失败则继续守候（结账态可能已被消费，下一轮会重建）
+                    still.push((account_id, part, store, state_snapshot, proxy, contact.clone()));
+                }
+            }
+            if still.is_empty() {
+                watch_state.log("batch", "info", "watch 所有账号已完成，任务结束").await;
+                break;
+            }
+            ready = still;
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        }
+    });
+
+    state
+        .inner
+        .handles
+        .lock()
+        .await
+        .insert(WATCH_HANDLE_KEY.to_string(), handle);
+    Json(json!({"ok": true, "accounts": account_count, "interval_ms": interval_ms})).into_response()
+}
+
+/// 停止 watch 模式
+pub async fn api_watch_stop(State(state): State<AppState>) -> impl IntoResponse {
+    let stopped = if let Some(handle) = state.inner.handles.lock().await.remove(WATCH_HANDLE_KEY) {
+        handle.abort();
+        true
+    } else {
+        false
+    };
+    state
+        .log(
+            "batch",
+            "info",
+            if stopped { "watch 已停止" } else { "watch 未在运行" },
+        )
+        .await;
+    Json(json!({"ok": true, "stopped": stopped})).into_response()
+}
+
+/// 查询 watch 运行状态
+pub async fn api_watch_status(State(state): State<AppState>) -> impl IntoResponse {
+    // 句柄可能已结束但还没被 CleanupTask 回收，用 is_finished() 判定真实运行状态。
+    let mut handles = state.inner.handles.lock().await;
+    let running = match handles.get(WATCH_HANDLE_KEY) {
+        Some(handle) if !handle.is_finished() => true,
+        Some(_) => {
+            // 已结束：顺手回收句柄
+            handles.remove(WATCH_HANDLE_KEY);
+            false
+        }
+        None => false,
+    };
+    drop(handles);
+    Json(json!({"ok": true, "running": running})).into_response()
 }
 
 pub async fn api_stop(State(state): State<AppState>) -> StatusCode {

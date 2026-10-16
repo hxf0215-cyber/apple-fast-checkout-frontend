@@ -166,6 +166,14 @@ pub struct GlobalSettings {
     /// 订单上传总开关
     #[serde(default = "default_order_upload_enabled")]
     pub order_upload_enabled: bool,
+
+    // ===== watch 模式（守着结账态等库存）=====
+    /// watch 刷新间隔（毫秒）
+    #[serde(default = "default_watch_interval_ms")]
+    pub watch_interval_ms: u64,
+    /// watch 单账号刷新的最大次数（0 = 不限）
+    #[serde(default = "default_watch_max_refresh")]
+    pub watch_max_refresh: u64,
 }
 
 impl Default for GlobalSettings {
@@ -206,6 +214,8 @@ impl Default for GlobalSettings {
             proxy_pool_format: default_proxy_pool_format(),
             order_upload_url: default_order_upload_url(),
             order_upload_enabled: default_order_upload_enabled(),
+            watch_interval_ms: default_watch_interval_ms(),
+            watch_max_refresh: default_watch_max_refresh(),
         }
     }
 }
@@ -435,4 +445,12 @@ fn default_order_upload_url() -> String {
 
 fn default_order_upload_enabled() -> bool {
     true
+}
+
+fn default_watch_interval_ms() -> u64 {
+    800
+}
+
+fn default_watch_max_refresh() -> u64 {
+    0
 }
