@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Apple 小程序初始化接口：领取会话指纹 Cookie `masts`（缺它时购物类接口会 302 到 covers.html/npip）。
+const INIT: &str =
+    "https://web.mmap.apple.com/miniprogram-merch/p/wechat/init";
 const CART_ADD: &str =
     "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-merch/p/wechat/cart/add";
 const BAG: &str = "https://web.mmap.apple.com/moe/p/wechat/chat/bag";
@@ -52,6 +55,9 @@ pub struct WeChatFlow {
     contact: Value,
     selected_time_slot: Value,
     fast: bool,
+    /// 本轮流程是否已经调过 init 领 masts（避免每个步骤都重复请求）。
+    /// Apple 只在它认为需要时才下发 masts，未下发不代表失败。
+    masts_attempted: bool,
     /// 本流程实际使用的代理（空 = 直连）。预热/预准备会话与下单必须使用同一出口 IP，
     /// 否则 Apple 会判定会话失效（403）。
     proxy_url: String,
@@ -68,6 +74,9 @@ fn build_wechat_client(proxy: Option<Proxy>) -> Result<Client> {
         .pool_max_idle_per_host(64)
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true);
+    // 注意：这里不禁用自动解压。Apple 的响应仍可能带 Content-Encoding: gzip，
+    // 关掉解压会拿到压缩字节、JSON 解析直接失败。每个请求会显式声明
+    // Accept-Encoding: zstd，reqwest 不会再用自己的默认值覆盖它。
     match proxy {
         Some(p) => builder = builder.proxy(p),
         None => builder = builder.no_proxy(),
@@ -179,6 +188,7 @@ impl WeChatFlow {
             contact,
             selected_time_slot: json!({}),
             fast,
+            masts_attempted: false,
             proxy_url: proxy_url.to_string(),
         })
     }
@@ -274,9 +284,17 @@ impl WeChatFlow {
         let started = Instant::now();
         // 541 是 Apple 的限流信号，退避要足够长才有机会恢复
         let retry_delays_ms = [3_000, 8_000, 15_000];
+        // 命中 npip 拦截页时只允许「重新领取 masts + 重放」一次，避免死循环
+        let mut masts_refresh_used = false;
         for attempt in 0..=retry_delays_ms.len() {
+            // masts 是 Apple 签发的会话指纹，缺它时购物类接口可能被判为异常客户端。
+            // 每个流程只尝试领取一次；Apple 未下发属正常情况，继续走原请求。
+            self.ensure_masts_once().await;
             let mut request = self.client.request(method.clone(), url);
-            request = request.header("Accept-Encoding", "gzip, deflate, br, zstd");
+            // 只声明 zstd —— 实测声明 gzip 会被 Apple 判定为异常客户端，
+            // 直接返回 302 到 covers.html（x-ma-covers: npip）拦截页。
+            // 注意：不能改成"不发"，因为 reqwest 在 build 时会自动补 gzip。
+            request = request.header("Accept-Encoding", "zstd");
             request = request.header("Accept", "application/json, text/plain, */*");
             request = request.header("Connection", "keep-alive");
             request = request.header("Accept-Language", "zh-CN,zh-Hans;q=0.9");
@@ -285,6 +303,10 @@ impl WeChatFlow {
                 "https://servicewechat.com/wxbc25a7df24ae0e6a/164/page-frame.html",
             );
             request = request.header("xweb_xhr", "1");
+            if url == INIT {
+                // 小程序 init 请求固定带的版本头
+                request = request.header("x-ma-version", "26.07.0-MAIN");
+            }
             request = request.header("cookie", self.cookie_header());
             if method == Method::POST {
                 request = request.header("Content-Type", "application/x-www-form-urlencoded");
@@ -315,10 +337,84 @@ impl WeChatFlow {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            // Apple 的网络限制标记：命中 npip 说明当前出口不被购物类接口接受
+            let covers_tag = response
+                .headers()
+                .get("x-ma-covers")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
             self.update_cookies(&response);
             let text = response.text().await?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            let value: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+            // 解析响应：这里必须严格，不能把解析失败静默变成空对象。
+            // 之前用 unwrap_or(json!({})) 会导致「Apple 返回 HTML 等待页」被误判成
+            // 「购物袋是真的空的」，进而抛出误导性的 target item not found。
+            let value: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(parse_err) => {
+                    // 识别 Apple 的网络限制页（302 重定向到 covers.html，带 x-ma-covers: npip）
+                    let npip = covers_tag == "npip" || is_apple_cover_page(&text);
+                    // 先记录这一步（便于日志里看到真实状态码与响应类型）
+                    self.steps.push(json!({
+                        "name": name,
+                        "method": method.as_str(),
+                        "url": url,
+                        "status": status,
+                        "body": body.unwrap_or(""),
+                        "response_type": response_type,
+                        "note": if npip {
+                            "npip：出口被购物类接口拦截".to_string()
+                        } else {
+                            format!("non-json response: {parse_err}")
+                        },
+                        "elapsed_ms": elapsed_ms,
+                    }));
+                    if npip {
+                        // 被 npip 拦截：强制重新领取一次 masts 后原样重放
+                        if !masts_refresh_used {
+                            masts_refresh_used = true;
+                            match self.refresh_masts().await {
+                                Ok(true) => {
+                                    self.steps.push(json!({
+                                        "name": "session_init",
+                                        "method": "GET",
+                                        "url": INIT,
+                                        "status": 200,
+                                        "response_type": "application/json",
+                                        "note": "npip 拦截后重新领取 masts",
+                                        "elapsed_ms": 0,
+                                    }));
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(err) => {
+                                    self.steps.push(json!({
+                                        "name": "session_init",
+                                        "method": "GET",
+                                        "url": INIT,
+                                        "status": 0,
+                                        "response_type": "",
+                                        "note": format!("npip 后重新领取 masts 失败：{err}"),
+                                        "elapsed_ms": 0,
+                                    }));
+                                }
+                            }
+                        }
+                        bail!(
+                            "Apple 限制了当前网络环境访问 {}（返回 npip 拦截页）。已尝试重新领取 masts 仍被拦截，通常表示该出口 IP 不被购物类接口接受，请更换代理或直连测试。",
+                            name
+                        );
+                    }
+                    bail!(
+                        "{} 返回非 JSON（HTTP {}，Content-Type: {}）：{}",
+                        name,
+                        status,
+                        if response_type.is_empty() { "-" } else { &response_type },
+                        &text[..text.len().min(200)]
+                    );
+                }
+            };
             let note = if (status == 541 || status == 503) && attempt < retry_delays_ms.len() {
                 format!("{} retry in {}ms", status, retry_delays_ms[attempt])
             } else {
@@ -423,6 +519,77 @@ impl WeChatFlow {
             .collect::<Vec<_>>()
             .join(",");
         bail!("spoke {} not found; spokes: {}", id, spokes)
+    }
+
+    /// 是否已持有 Apple 签发的会话指纹 Cookie。
+    fn has_masts(&self) -> bool {
+        self.cookies
+            .get("masts")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// 每个流程最多尝试领取一次 masts（Apple 未下发时不算失败）。
+    async fn ensure_masts_once(&mut self) {
+        if self.has_masts() || self.masts_attempted {
+            return;
+        }
+        self.masts_attempted = true;
+        match self.refresh_masts().await {
+            Ok(true) => {
+                self.steps.push(json!({
+                    "name": "session_init",
+                    "method": "GET",
+                    "url": INIT,
+                    "status": 200,
+                    "response_type": "application/json",
+                    "note": "已从 init 领取 masts",
+                    "elapsed_ms": 0,
+                }));
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.steps.push(json!({
+                    "name": "session_init",
+                    "method": "GET",
+                    "url": INIT,
+                    "status": 0,
+                    "response_type": "",
+                    "note": format!("masts 领取失败：{err}"),
+                    "elapsed_ms": 0,
+                }));
+            }
+        }
+    }
+
+    /// 调 init 领取 masts。这里直接发请求（不经过 request_json），
+    /// 避免 request_json → refresh_masts → request_json 的递归。
+    /// 返回 true 表示本次拿到了 masts。
+    async fn refresh_masts(&mut self) -> Result<bool> {
+        let request = self
+            .client
+            .request(Method::GET, INIT)
+            .header("Accept-Encoding", "zstd")
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Connection", "keep-alive")
+            .header("Accept-Language", "zh-CN,zh-Hans;q=0.9")
+            .header(
+                "Referer",
+                "https://servicewechat.com/wxbc25a7df24ae0e6a/164/page-frame.html",
+            )
+            .header("content-type", "application/json")
+            .header("x-ma-version", "26.07.0-MAIN")
+            .header("cookie", self.cookie_header())
+            .build()?;
+        let response = self.client.execute(request).await?;
+        let status = response.status().as_u16();
+        self.update_cookies(&response);
+        let _ = response.text().await?;
+        if status != 200 {
+            bail!("init 返回 HTTP {status}");
+        }
+        // Apple 只在它认为需要时下发 masts；未下发时同样返回 200，属正常情况。
+        Ok(self.has_masts())
     }
 
     async fn bag(&mut self) -> Result<Value> {
@@ -589,7 +756,68 @@ impl WeChatFlow {
         Ok(data)
     }
 
+    /// 把商品从「送货」切到「到店取货」。
+    ///
+    /// Apple 会按商品/门店把 fulfillment 默认成 HOME 或 RETAIL：
+    /// - HOME：spokes = shipping / billing / invoice，没有 pickup；
+    /// - RETAIL：spokes = pickup / 3pp / billing / invoice。
+    /// 目标是到店取货，因此发现是 HOME 时提交一次 deliveryLocationType=RETAIL。
+    async fn ensure_pickup_fulfillment(&mut self) -> Result<()> {
+        let already_pickup = self.spokes().iter().any(|spoke| {
+            matches!(
+                spoke.get("id").and_then(Value::as_str),
+                Some("pickup") | Some("timeSlot")
+            )
+        });
+        if already_pickup {
+            return Ok(());
+        }
+        let item = self
+            .landing
+            .pointer("/review/fulfillment/items/0")
+            .cloned()
+            .unwrap_or(json!({}));
+        let is_home = item
+            .get("isHomeDelivery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !is_home {
+            return Ok(());
+        }
+        let url = item
+            .get("selectDeliveryMethod")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if url.is_empty() {
+            return Ok(());
+        }
+        let prefix = item
+            .get("keyPath")
+            .and_then(Value::as_str)
+            .unwrap_or("checkout.review.fulfillment.items.0");
+        let body = format!("{}.deliveryLocationType=RETAIL", prefix);
+        let data = self
+            .request_json(
+                "select_delivery_method",
+                Method::POST,
+                &url,
+                Some(&body),
+                true,
+            )
+            .await?;
+        // 切换成功后返回体带 review/spokes，refresh 会用它更新 landing
+        self.refresh(&data);
+        if self.spokes().is_empty() {
+            bail!("切换到店取货失败：Apple 未返回可用的结账步骤");
+        }
+        Ok(())
+    }
+
     async fn change_store(&mut self) -> Result<Value> {
+        // Apple 可能把商品默认为「送货」，此时 spokes 里没有 pickup/timeSlot，
+        // 必须先切到「到店取货」，后面的选店 / 时间段 / 到店联系人链路才存在。
+        self.ensure_pickup_fulfillment().await?;
         let url = self
             .landing
             .pointer("/review/fulfillment/items/0/changeStoreAction")
@@ -793,7 +1021,12 @@ impl WeChatFlow {
             .await?;
         let select_url = find_url(&data, "selectPickupMethodUrl").0;
         if select_url.is_empty() {
-            bail!("pickup missing selectPickupMethodUrl");
+            let view = data.get("view").and_then(Value::as_str).unwrap_or("-");
+                        let compact = serde_json::to_string(&data).unwrap_or_default();
+                        bail!(
+                            "pickup missing selectPickupMethodUrl (view={view}; body={})",
+                            &compact[..compact.len().min(800)]
+                        );
         }
         let key_path = find_url(&data, "selectPickupMethodUrl").1;
         let body = format!(
@@ -1328,6 +1561,19 @@ impl WeChatFlow {
             self.complete_checkout(true).await
         }
     }
+}
+
+/// 判断响应体是否是 Apple 的「网络限制/等待」页。
+///
+/// Apple 会对某些网络环境或时间段把接口 302 到 `/wow-assets/covers.html`，
+/// 页面里带有 `x-ma-covers: npip`（no proxy/受限 IP）标记，返回的是 HTML 而非 JSON。
+/// 识别出来可以给出准确提示，避免被误判成「购物袋为空」。
+fn is_apple_cover_page(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // covers.html 是 Apple 的拦截/等待页特征
+    lower.contains("covers.html")
+        || lower.contains("<!doctype html>") && lower.contains("wow-assets")
+        || text.contains("<!-- covers -->")
 }
 
 fn find_url(data: &Value, key: &str) -> (String, String) {
