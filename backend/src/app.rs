@@ -686,17 +686,48 @@ fn is_retryable_wechat_session_error(result: &Value) -> bool {
         .any(|keyword| message.contains(keyword))
 }
 
+/// 按「字符边界」安全截断，最多保留 `max_bytes` 字节（不会 panic）。
+///
+/// Rust 的 `&s[..n]` 要求 n 必须落在 UTF-8 字符边界上，否则 panic。
+/// Apple 的响应/错误信息常含中文，`&s[..s.len().min(N)]` 这种写法
+/// 在截断点正好落在多字节字符中间时会直接崩掉整个请求，必须用本函数。
+pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// 把账号 id 转成安全的文件名。
+///
+/// 不能简单地把所有非法字符都替换成 `_`：`a@b.com` 与 `a_b.com` 会撞成同一个
+/// 文件名，导致两个账号互相覆盖 cookie 文件。因此这里对「被替换掉的字符」
+/// 追加一段基于原值的短哈希后缀，保证不同 id 不会映射到同一路径。
 fn safe_file_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(value.len() + 12);
+    let mut replaced = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+            replaced = true;
+        }
+    }
+    if replaced {
+        // FNV-1a 32bit：碰撞概率极低，且对同一 id 稳定
+        let mut hash: u32 = 0x811c9dc5;
+        for byte in value.as_bytes() {
+            hash ^= *byte as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        out.push_str(&format!("~{hash:08x}"));
+    }
+    out
 }
 
 fn clean_order_error(error: &str) -> String {
@@ -706,7 +737,7 @@ fn clean_order_error(error: &str) -> String {
         }
     }
     if error.len() > 260 {
-        format!("{}...", &error[..257])
+        format!("{}...", truncate_utf8(error, 257))
     } else {
         error.to_string()
     }
@@ -1203,7 +1234,7 @@ impl AppState {
         // 去重已通过 → 推送订单到外部接口。
         // 放在 drop(orders) 之后，避免与 upload_order 内取 config 锁形成嵌套。
         if !order_number.is_empty() {
-            self.upload_order(username, order_number, payment_link, part)
+            self.upload_order(account_id, username, order_number, payment_link, part)
                 .await;
         }
     }
@@ -1211,16 +1242,26 @@ impl AppState {
     /// 把成交订单推送到外部接口（fire-and-forget，绝不影响下单主流程）。
     ///
     /// 触发点在 record_order：那是订单落库的唯一入口，6 处下单路径全部汇聚于此。
-    async fn upload_order(&self, username: &str, order_number: &str, url: &str, part: &str) {
+    async fn upload_order(
+        &self,
+        account_id: &str,
+        username: &str,
+        order_number: &str,
+        url: &str,
+        part: &str,
+    ) {
         let (upload_url, enabled, cookie_text) = {
             let config = self.inner.config.lock().await;
             let enabled = config.settings.order_upload_enabled
                 && !config.settings.order_upload_url.trim().is_empty();
-            // 以 account_id（= username）匹配账号取 wechat_cookie
+            // 取 wechat_cookie 必须按 account_id 精确匹配：
+            // 同邮箱可以有多套配置（id = email / email#2 / email#3），
+            // 它们的 username 完全相同但 cookie 不同，按 username 找会串号。
             let cookie = config
                 .accounts
                 .iter()
-                .find(|a| a.username == username || a.id == username)
+                .find(|a| a.id == account_id)
+                .or_else(|| config.accounts.iter().find(|a| a.username == username))
                 .map(|a| a.wechat_cookie.clone())
                 .unwrap_or_default();
             (
@@ -1233,6 +1274,7 @@ impl AppState {
             return;
         }
         let payload = json!({
+            // 契约：account 传 username（邮箱），与接收端文档一致
             "account": username,
             "as_dima": pick_cookie_value(&cookie_text, "as_dima"),
             "as_pvi": pick_cookie_value(&cookie_text, "as_pvi"),
@@ -1272,7 +1314,7 @@ impl AppState {
                         "error",
                         format!(
                             "订单上传失败（HTTP {status}）：{}",
-                            &body[..body.len().min(200)]
+                            truncate_utf8(&body, 200)
                         ),
                     )
                     .await;
@@ -2328,8 +2370,10 @@ impl AppState {
         // 启动时：先做纯内存统计，再后台校验会话在服务端的真实性
         self.sync_statuses().await;
         let (ready_sessions, total_accounts) = {
-            let statuses = self.inner.statuses.lock().await;
+            // 锁顺序必须与 sync_statuses 一致（config → statuses），
+            // 否则两条路径并发时会互相等待造成死锁。
             let config = self.inner.config.lock().await;
+            let statuses = self.inner.statuses.lock().await;
             let total = config
                 .accounts
                 .iter()
@@ -6926,6 +6970,46 @@ mod app_tests {
             .expect("should produce an account");
         assert_eq!(acc.id, "a@x.com");
         assert_eq!(acc.username, "a@x.com");
+    }
+
+    // --- UTF-8 安全截断（防止多字节字符中间截断 panic）---
+
+    #[test]
+    fn truncate_utf8_never_panics_on_multibyte() {
+        // 全中文：任意字节位置切都可能落在字符中间
+        let s = "错误：".repeat(40);
+        assert_eq!(s.len(), 360);
+        // 257 落在多字节字符中间（旧实现会 panic）
+        let cut = truncate_utf8(&s, 257);
+        assert!(cut.len() <= 257);
+        assert!(s.starts_with(cut));
+        assert_eq!(truncate_utf8(&s, 300).len(), 300);
+        // 覆盖所有截断长度都不 panic
+        for n in 0..=s.len() + 5 {
+            let _ = truncate_utf8(&s, n);
+        }
+    }
+
+    #[test]
+    fn truncate_utf8_passthrough_when_short() {
+        assert_eq!(truncate_utf8("abc", 10), "abc");
+        assert_eq!(truncate_utf8("", 5), "");
+        assert_eq!(truncate_utf8("错误", 0), "");
+    }
+
+    // --- 文件名安全化：不同 id 不得撞同一路径 ---
+
+    #[test]
+    fn safe_file_name_does_not_collide() {
+        let a = safe_file_name("171997008@qq.com");
+        let b = safe_file_name("171997008_qq_com");
+        let c = safe_file_name("171997008@qq.com#2");
+        assert_ne!(a, b, "邮箱与下划线形式不能撞名");
+        assert_ne!(a, c, "同邮箱的不同序号不能撞名");
+        assert_ne!(b, c);
+        assert_eq!(a, safe_file_name("171997008@qq.com"));
+        assert_eq!(safe_file_name("1"), "1");
+        assert_eq!(safe_file_name("abc-123_x"), "abc-123_x");
     }
 
     // --- 订单上传：Cookie 提取 ---

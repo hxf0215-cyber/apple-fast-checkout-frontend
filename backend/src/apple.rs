@@ -598,7 +598,7 @@ impl AppleClient {
         let result: Value = serde_json::from_str(&body)?;
         self.last_add_response = body.clone();
         if result.get("addedToBag") != Some(&json!(true)) {
-            bail!("add to bag rejected: {}", &body[..body.len().min(200)]);
+            bail!("add to bag rejected: {}", crate::app::truncate_utf8(&body, 200));
         }
         Ok(())
     }
@@ -750,7 +750,7 @@ impl AppleClient {
             bail!(
                 "checkout_now failed with {} {}",
                 status,
-                &body[..body.len().min(200)]
+                crate::app::truncate_utf8(&body, 200)
             );
         }
         let secure_url = serde_json::from_str::<Value>(&body)?

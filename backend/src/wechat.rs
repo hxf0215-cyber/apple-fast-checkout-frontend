@@ -411,7 +411,7 @@ impl WeChatFlow {
                         name,
                         status,
                         if response_type.is_empty() { "-" } else { &response_type },
-                        &text[..text.len().min(200)]
+                        crate::app::truncate_utf8(&text, 200)
                     );
                 }
             };
@@ -444,7 +444,7 @@ impl WeChatFlow {
                 "{} failed with {}: {}",
                 name,
                 status,
-                &text[..text.len().min(300)]
+                crate::app::truncate_utf8(&text, 300)
             );
         }
         unreachable!("WeChat request retry loop must return");
@@ -1022,11 +1022,11 @@ impl WeChatFlow {
         let select_url = find_url(&data, "selectPickupMethodUrl").0;
         if select_url.is_empty() {
             let view = data.get("view").and_then(Value::as_str).unwrap_or("-");
-                        let compact = serde_json::to_string(&data).unwrap_or_default();
-                        bail!(
-                            "pickup missing selectPickupMethodUrl (view={view}; body={})",
-                            &compact[..compact.len().min(800)]
-                        );
+            let compact = serde_json::to_string(&data).unwrap_or_default();
+            bail!(
+                "pickup missing selectPickupMethodUrl (view={view}; body={})",
+                crate::app::truncate_utf8(&compact, 800)
+            );
         }
         let key_path = find_url(&data, "selectPickupMethodUrl").1;
         let body = format!(
