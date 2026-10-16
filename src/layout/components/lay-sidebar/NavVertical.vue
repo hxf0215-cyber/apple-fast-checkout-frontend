@@ -14,6 +14,7 @@ import SearchIcon from "~icons/ep/search";
 import EditIcon from "~icons/ep/edit";
 import UploadIcon from "~icons/ep/upload";
 import MonitorIcon from "~icons/ep/monitor";
+import ConnectionIcon from "~icons/ep/connection";
 import LaySidebarLogo from "../lay-sidebar/components/SidebarLogo.vue";
 import LaySidebarItem from "../lay-sidebar/components/SidebarItem.vue";
 import LaySidebarLeftCollapse from "../lay-sidebar/components/SidebarLeftCollapse.vue";
@@ -63,6 +64,10 @@ const FLAT_MENUS = [
   {
     path: "/query",
     meta: { title: "库存查询", icon: SearchIcon, showLink: true }
+  },
+  {
+    path: "/proxytest",
+    meta: { title: "代理检测", icon: ConnectionIcon, showLink: true }
   },
   {
     path: "/logs",

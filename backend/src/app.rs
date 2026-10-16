@@ -6303,6 +6303,262 @@ pub async fn api_update_settings(
     StatusCode::OK
 }
 
+
+/// 代理测试请求体
+#[derive(Debug, Deserialize)]
+pub struct ProxyTestRequest {
+    /// 待测代理列表（每行一个，支持 IP|端口|账号|密码 等格式）
+    pub proxies: Vec<String>,
+    /// 并发数（默认 8）
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// 单请求超时毫秒（默认 10000）
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// 单个测试目标
+fn proxy_test_targets() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    // (类别, 名称, URL, 期望特征)
+    vec![
+        (
+            "后端",
+            "Apple官网",
+            "https://www.apple.com.cn/",
+            "apple",
+        ),
+        (
+            "前端",
+            "小程序库存",
+            "https://web.mmap.apple.com/26.07.0-MAIN/miniprogram-merch/p/wechat/product-locator/quotes?pn=MJT74CH%2FA&stores=R480",
+            "mmap",
+        ),
+        (
+            "前端",
+            "小程序袋子",
+            "https://web.mmap.apple.com/moe/p/wechat/chat/bag",
+            "mmap",
+        ),
+    ]
+}
+
+/// 测试单个代理的所有目标，返回明细与是否全部通过
+async fn test_one_proxy(
+    proxy_raw: &str,
+    timeout_ms: u64,
+) -> Value {
+    let normalized = normalize_static_proxy(proxy_raw);
+    if normalized.is_empty() {
+        return json!({
+            "proxy": proxy_raw,
+            "ok": false,
+            "error": "无法解析代理格式",
+            "details": [],
+        });
+    }
+
+    let proxy = match reqwest::Proxy::all(&normalized) {
+        Ok(p) => p,
+        Err(e) => {
+            return json!({
+                "proxy": proxy_raw,
+                "ok": false,
+                "error": format!("代理地址无效：{e}"),
+                "details": [],
+            })
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .connect_timeout(std::time::Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.79")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({
+                "proxy": proxy_raw,
+                "ok": false,
+                "error": format!("创建客户端失败：{e}"),
+                "details": [],
+            })
+        }
+    };
+
+    let mut details: Vec<Value> = Vec::new();
+    let mut all_ok = true;
+    let mut max_ms: u64 = 0;
+
+    for (kind, name, url, expect) in proxy_test_targets() {
+        let started = std::time::Instant::now();
+        let result = client.get(url).send().await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms > max_ms {
+            max_ms = elapsed_ms;
+        }
+
+        let (status, note, ok) = match result {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                let location = resp
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body = resp.text().await.unwrap_or_default();
+
+                if code == 407 {
+                    (code, "代理认证失败".to_string(), false)
+                } else if code == 403 {
+                    (code, "被拒绝(403)".to_string(), false)
+                } else if expect == "mmap" {
+                    // 小程序接口：302 -> covers.html 是 Apple 预购等待页，代理本身没问题
+                    if (code == 301 || code == 302) && location.contains("covers.html") {
+                        (code, "预购等待期(Apple未开放)".to_string(), true)
+                    } else if code == 301 || code == 302 {
+                        (code, "OK(跳转)".to_string(), true)
+                    } else if code == 200 {
+                        (code, "OK".to_string(), true)
+                    } else {
+                        (code, format!("OK(需Cookie:{code})"), true)
+                    }
+                } else {
+                    let low = body.to_lowercase();
+                    if low.contains("apple") {
+                        (code, "OK".to_string(), true)
+                    } else if !body.is_empty() {
+                        (code, "内容非Apple".to_string(), false)
+                    } else {
+                        (code, "空响应".to_string(), false)
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = if e.is_timeout() {
+                    "连接超时".to_string()
+                } else if e.is_connect() {
+                    "连接失败".to_string()
+                } else {
+                    format!("请求失败：{}", e.to_string().chars().take(60).collect::<String>())
+                };
+                (0u16, msg, false)
+            }
+        };
+
+        if !ok {
+            all_ok = false;
+        }
+        details.push(json!({
+            "kind": kind,
+            "name": name,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "note": note,
+            "ok": ok,
+        }));
+    }
+
+    json!({
+        "proxy": proxy_raw,
+        "normalized": normalized,
+        "exit_ip": normalized
+            .rsplit('@')
+            .next()
+            .and_then(|hp| hp.split(':').next())
+            .unwrap_or(""),
+        "ok": all_ok,
+        "max_ms": max_ms,
+        "details": details,
+    })
+}
+
+/// POST /api/proxy/test —— 批量测试代理（前端 + 后端目标）
+pub async fn api_proxy_test(
+    State(state): State<AppState>,
+    Json(payload): Json<ProxyTestRequest>,
+) -> Json<Value> {
+    let proxies: Vec<String> = payload
+        .proxies
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if proxies.is_empty() {
+        return Json(json!({"ok": false, "error": "没有提供代理"}));
+    }
+
+    let concurrency = payload.concurrency.unwrap_or(8).clamp(1, 64);
+    let timeout_ms = payload.timeout_ms.unwrap_or(10_000).clamp(2000, 60_000);
+
+    state
+        .log(
+            "batch",
+            "info",
+            format!("开始测试 {} 个代理（并发 {concurrency}）", proxies.len()),
+        )
+        .await;
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    for raw in proxies {
+        let sem = sem.clone();
+        tasks.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            test_one_proxy(&raw, timeout_ms).await
+        });
+    }
+
+    let mut results: Vec<Value> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(v) = joined {
+            results.push(v);
+        }
+    }
+
+    // 汇总
+    let total = results.len();
+    let ok_count = results
+        .iter()
+        .filter(|r| r.get("ok") == Some(&json!(true)))
+        .count();
+    let mut ok_proxies: Vec<&str> = results
+        .iter()
+        .filter(|r| r.get("ok") == Some(&json!(true)))
+        .filter_map(|r| r.get("proxy").and_then(Value::as_str))
+        .collect();
+    // 按耗时排序
+    ok_proxies.sort_by_key(|p| {
+        results
+            .iter()
+            .find(|r| r.get("proxy").and_then(Value::as_str) == Some(*p))
+            .and_then(|r| r.get("max_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
+
+    state
+        .log(
+            "batch",
+            "info",
+            format!("代理测试完成：可用 {ok_count}/{total}"),
+        )
+        .await;
+
+    Json(json!({
+        "ok": true,
+        "total": total,
+        "available": ok_count,
+        "unavailable": total.saturating_sub(ok_count),
+        "ok_proxies": ok_proxies,
+        "results": results,
+    }))
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;

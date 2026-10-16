@@ -91,8 +91,51 @@ pub fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// 把工作目录切到「可执行文件所在目录」。
+///
+/// 原因：程序里所有资源路径（static/、config.bin、logs/、backups/）都是相对的。
+/// 双击 exe 时工作目录可能就是 exe 目录，但从快捷方式、命令行或其他目录启动时不是，
+/// 会导致找不到 static/ 而启动失败（表现为"闪退"）。这里统一修正。
+/// 开发时（cargo run）exe 在 target/release/ 下，需要向上找到项目根（含 Cargo.toml 的那层）。
+fn set_working_dir_to_exe_dir() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return;
+    };
+
+    // cargo run 场景：target/release/xxx.exe → 向上查找含 Cargo.toml 的目录
+    let mut candidate = exe_dir.to_path_buf();
+    for _ in 0..4 {
+        if candidate.join("Cargo.toml").exists() {
+            break;
+        }
+        match candidate.parent() {
+            Some(parent) => candidate = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    // 发布版：exe 目录本身就是根（含 static/）
+    let root = if exe_dir.join("static").exists() {
+        exe_dir.to_path_buf()
+    } else if candidate.join("static").exists() {
+        candidate
+    } else {
+        exe_dir.to_path_buf()
+    };
+
+    if std::env::set_current_dir(&root).is_ok() {
+        println!("Working directory: {}", root.display());
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // 必须在读取任何资源前执行：修正工作目录到 exe 所在目录
+    set_working_dir_to_exe_dir();
+
     let state = app::AppState::load_or_create("config.bin").await;
     state.start_session_keeper().await;
     state.start_proxy_pool_keeper().await;
@@ -127,6 +170,7 @@ async fn main() {
             "/api/wechat/warmup-batch",
             post(app::api_wechat_warmup_batch),
         )
+        .route("/api/proxy/test", post(app::api_proxy_test))
         .route("/api/proxy-pool/stats", get(app::api_proxy_pool_stats))
         .route("/api/proxy-pool/clear", post(app::api_proxy_pool_clear))
         .route("/api/proxy-pool/fetch", post(app::api_proxy_pool_fetch))
@@ -136,11 +180,47 @@ async fn main() {
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("Dashboard: http://0.0.0.0:8080");
-    println!("WebSocket: ws://0.0.0.0:8080/ws");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind 0.0.0.0:8080");
+    // 端口自动探测：8080 被占用时依次尝试后续端口，避免直接崩溃（双击启动时很常见）
+    let (listener, port) = {
+        let mut bound = None;
+        for candidate in 8080u16..8090 {
+            let addr = SocketAddr::from(([0, 0, 0, 0], candidate));
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => {
+                    bound = Some((l, candidate));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => {
+                    eprintln!("无法绑定端口 {candidate}：{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        match bound {
+            Some(v) => v,
+            None => {
+                eprintln!("8080-8089 全部被占用，请先关闭占用端口的程序。");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    println!("========================================");
+    println!("  Apple Fast Checkout 已启动");
+    println!("  控制台地址: http://127.0.0.1:{port}");
+    println!("  局域网访问: http://本机IP:{port}");
+    println!("  关闭本窗口即停止服务");
+    println!("========================================");
+
+    // 自动打开浏览器（失败不影响服务）
+    let url = format!("http://127.0.0.1:{port}");
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn();
+    }
+
     axum::serve(listener, app).await.expect("server stopped");
 }

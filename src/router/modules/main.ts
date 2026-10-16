@@ -47,6 +47,12 @@ export default {
       meta: { title: "库存查询", showLink: true, showParent: false }
     },
     {
+      path: "/proxytest",
+      name: "ProxyTest",
+      component: () => import("@/views/proxytest/index.vue"),
+      meta: { title: "代理检测", showLink: true, showParent: false }
+    },
+    {
       path: "/logs",
       name: "Logs",
       component: () => import("@/views/logs/index.vue"),

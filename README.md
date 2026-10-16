@@ -129,6 +129,7 @@ Vite 已配置代理，开发模式下 `/api` 和 `/static` 都会转发到 `htt
 - 静态代理：每个账号固定出口 IP，支持 `IP|端口|账号|密码` 格式
 - 实时推送：WebSocket 推送状态与日志（只在数据变化时发送）
 - 完整下单链：加购 → 结账 → 选店 → 取货时段 → 联系人 → 支付 → 下单
+- 代理检测页：批量测静态代理（同时验证前端小程序接口 + 后端官网），一键挑出可用 IP
 - 订单历史、日志高亮与检索、批量导入账号 / Cookie
 
 ---
@@ -160,7 +161,36 @@ Vite 已配置代理，开发模式下 `/api` 和 `/static` 都会转发到 `htt
 
 ---
 
-## 七、配置
+## 七、测试代理（可选工具）
+
+`backend/test-proxy.ps1` 是独立的代理测试脚本，不依赖程序运行，直接调用 curl：
+
+```powershell
+# 单个代理（详细：TCP + 3 个 Apple 目标 + 出口 IP）
+.\backend\test-proxy.ps1 -Proxy "192.3.248.101|11433|user|pass"
+
+# 批量（从文件读，并发测试）
+.\backend\test-proxy.ps1 -File .\backend\proxies.example.txt -Concurrency 20
+
+# 导出 CSV
+.\backend\test-proxy.ps1 -File .\proxies.txt -OutCsv .\result.csv
+```
+
+每个代理会测 3 个目标：
+
+| 类别 | 目标 | 用途 |
+|---|---|---|
+| 后端 | `www.apple.com.cn` | Rust 后端网页商城请求 |
+| 前端 | 小程序库存接口 `product-locator/quotes` | 实际下单链路 |
+| 前端 | 小程序购物袋 `chat/bag` | 实际下单链路 |
+
+> 小程序接口返回 `302 → covers.html` 是 **Apple 预购等待期**的正常行为，脚本会判定为「代理可用但 Apple 未开放」，不算代理失败。
+
+前端也有同样功能的可视化页面：`/#/proxytest`
+
+---
+
+## 八、配置
 
 首次启动会自动生成加密配置 `backend/config.bin`，并在前端页面里配置账号。
 
@@ -182,7 +212,7 @@ socks5://1.2.3.4:1080
 
 ---
 
-## 八、注意事项
+## 九、注意事项
 
 ### 数据安全
 
@@ -206,6 +236,6 @@ Apple 的库存查询接口（`product-locator/quotes`）在**预购开始前**�
 
 ---
 
-## 九、许可
+## 十、许可
 
 仅供学习研究使用。

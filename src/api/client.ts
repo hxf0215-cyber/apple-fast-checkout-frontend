@@ -146,6 +146,35 @@ export type ProxyPoolStats = {
   last_fetch_error?: string | null;
 };
 
+export type ProxyTestDetail = {
+  kind: string;
+  name: string;
+  status: number;
+  elapsed_ms: number;
+  note: string;
+  ok: boolean;
+};
+
+export type ProxyTestResult = {
+  proxy: string;
+  normalized?: string;
+  exit_ip?: string;
+  ok: boolean;
+  max_ms?: number;
+  error?: string;
+  details: ProxyTestDetail[];
+};
+
+export type ProxyTestResponse = {
+  ok: boolean;
+  total?: number;
+  available?: number;
+  unavailable?: number;
+  ok_proxies?: string[];
+  results?: ProxyTestResult[];
+  error?: string;
+};
+
 export type AppStatePayload = {
   settings: GlobalSettings;
   accounts: AccountStatus[];
@@ -197,6 +226,10 @@ export const api = {
     }),
   models: () => http.get<null, PhoneModel[]>("/api/models"),
   stores: () => http.get<null, StoreInfo[]>("/static/stores.json"),
+  proxyTest: (proxies: string[], concurrency = 8, timeout_ms = 10000) =>
+    http.post<null, ProxyTestResponse>("/api/proxy/test", {
+      data: { proxies, concurrency, timeout_ms }
+    }),
   proxyPoolStats: () => http.get<null, ProxyPoolStats>("/api/proxy-pool/stats"),
   proxyPoolClear: () => http.post<null, { ok: boolean; cleared: number }>("/api/proxy-pool/clear", { data: {} }),
   proxyPoolFetch: () => http.post<null, { ok: boolean; fetched?: number; error?: string }>("/api/proxy-pool/fetch", { data: {} }),
