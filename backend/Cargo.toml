@@ -18,6 +18,8 @@ chacha20poly1305 = "0.10"
 rand = "0.8"
 anyhow = "1"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
+# 用于捕获后台任务的 panic（单层 spawn + catch_unwind，保证 abort 有效）
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 # 注意：不能设 panic="abort" —— 常驻任务依赖 unwind 才能被捕获并写日志

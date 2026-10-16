@@ -137,9 +137,10 @@ async function load() {
     selectedAccountId.value = result.accounts[0].id;
 }
 
-function fillSettings(force = false) {
-  if (settingsLoaded && !force) return;
-  settingsLoaded = true;
+// 把后端配置同步到表单。
+// 不再使用「只填一次」的守卫 —— 那会导致首次填充失败后（前置请求抛异常）表单永久停留在
+// 默认值，用户刷新后看到「配置被清空」。现在每次调用都会同步，避免这种假象。
+function fillSettings() {
   if (!state.value) return;
   const settings = state.value.settings;
   settingsForm.batchPrepareConcurrency =
@@ -524,39 +525,82 @@ function exportReport() {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 const { state: wsState, connected: wsConnected } = useRealtime();
-watch(wsState, (newState: any) => {
-  if (newState && newState.accounts) {
+// 是否已完成首次设置同步（避免 WebSocket 推送覆盖用户正在编辑的内容）
+let settingsSyncedOnce = false;
+
+watch(
+  wsState,
+  (newState: any) => {
+    if (!newState || !newState.accounts) return;
     state.value = newState;
-  }
-}, { immediate: true });
+    // 双保险：首次拿到带 settings 的状态时同步一次表单。
+    // 这样即使 onMounted 的 step 1 失败了，WebSocket 推来数据后表单也能正确回填，
+    // 不会再出现「刷新后静态 IP 列表变空」的假象。
+    if (!settingsSyncedOnce && newState.settings) {
+      settingsSyncedOnce = true;
+      try {
+        fillSettings();
+      } catch (error) {
+        console.error("monitor: fillSettings via ws failed:", error);
+      }
+    }
+  },
+  { immediate: true }
+);
 
 onMounted(async () => {
+  // 初始化分三步独立容错：任一步失败都不影响其它步骤。
+  // 尤其是设置同步（step 2）必须与账号详情加载解耦 —— 否则账号详情请求失败会导致
+  // 表单停留在默认值，用户刷新后误以为「配置被清空」。
+
+  // step 1：拉取基础数据（状态 / 型号 / 门店）
+  let stateResult: AppStatePayload | null = null;
+  let modelList: PhoneModel[] = [];
+  let storeList: StoreInfo[] = [];
   try {
-    const [stateResult, modelList, storeList] = await Promise.all([
-      api.state(),
-      api.models(),
-      api.stores()
-    ]);
-    state.value = stateResult;
-    models.value = modelList || [];
-    stores.value = storeList || [];
-    selectedAccountId.value = stateResult.accounts[0]?.id || "";
+    const [s, m, st] = await Promise.all([api.state(), api.models(), api.stores()]);
+    stateResult = s;
+    modelList = m || [];
+    storeList = st || [];
+    state.value = s;
+    models.value = modelList;
+    stores.value = storeList;
+    selectedAccountId.value = s.accounts[0]?.id || "";
     manualForm.accountId = selectedAccountId.value;
     wechatForm.accountId = selectedAccountId.value;
     manualForm.part =
-      stateResult.accounts[0]?.parts?.[0] || modelList?.[0]?.part || "";
+      s.accounts[0]?.parts?.[0] || modelList?.[0]?.part || "";
     wechatForm.part = manualForm.part;
-    await loadWechatDetail(true);
-    fillSettings();
-    await loadProxyPoolStats();
-    // 代理池状态独立定时刷新（与主轮询解耦）
-    setInterval(() => {
-      if (settingsForm.proxyPoolEnabled) loadProxyPoolStats();
-    }, 10000);
-  // 轮询仅在 WebSocket 断开时启用（见文件底部 watch(wsConnected)）
   } catch (error: any) {
-    console.error("monitor init failed:", error);
+    console.error("monitor: load state failed:", error);
+    ElMessage.error("页面数据加载失败，请刷新重试");
   }
+
+  // step 2：同步设置到表单（关键！不依赖 step 3，失败也不影响）
+  // 这一步决定了「静态 IP 列表 / 开关」是否显示为已保存的值。
+  try {
+    fillSettings();
+  } catch (error: any) {
+    console.error("monitor: fillSettings failed:", error);
+    ElMessage.error("配置回填失败，请刷新页面");
+  }
+
+  // step 3：加载账号详情 + 代理池统计（失败只提示，不阻断）
+  try {
+    await loadWechatDetail(true);
+  } catch (error: any) {
+    console.error("monitor: loadWechatDetail failed:", error);
+  }
+  try {
+    await loadProxyPoolStats();
+  } catch (error: any) {
+    console.error("monitor: loadProxyPoolStats failed:", error);
+  }
+
+  // 代理池状态独立定时刷新（与主轮询解耦）
+  setInterval(() => {
+    if (settingsForm.proxyPoolEnabled) loadProxyPoolStats();
+  }, 10000);
 });
 
 watch(selectedAccountId, id => {

@@ -1070,37 +1070,39 @@ impl AppState {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     }
-    /// 启动一个「受保护」的后台任务：panic 时写日志 + 记录状态，而不是静默死亡。
-    /// tokio 的 JoinHandle 不会把子任务 panic 传播给父任务，若不显式捕获，
-    /// 监控/代理池/会话续期等常驻任务崩溃后前端仍会显示"运行中"。
+    /// 启动一个「受保护」的后台任务：panic 时写日志 + 标记状态，而不是静默死亡。
+    ///
+    /// 实现要点：必须是**单层 spawn**。
+    /// 早期版本用「外层 spawn + 内层 spawn 干活」来捕获 panic，但 api_stop 只能 abort
+    /// 外层 handle，内层任务继续跑 —— 表现为「日志说已停止，实际还在监控」。
+    /// 这里用 catch_unwind 在同一层捕获 panic，abort 才真正生效。
     fn spawn_guarded<F>(&self, name: &'static str, fut: F) -> JoinHandle<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        use futures_util::FutureExt;
+
         let state = self.clone();
         tokio::spawn(async move {
-            let result = tokio::spawn(fut).await;
-            match result {
-                Ok(()) => {}
-                Err(err) if err.is_panic() => {
-                    state
-                        .log(
-                            "batch",
-                            "error",
-                            format!("后台任务 [{name}] 异常崩溃（已自动停止）：{err}"),
-                        )
-                        .await;
-                    // 让前端能看到异常：把所有账号标记为 error
-                    let mut statuses = state.inner.statuses.lock().await;
-                    for status in statuses.values_mut() {
-                        if status.running {
-                            status.status = "error".to_string();
-                            status.last_error =
-                                Some(format!("后台任务 [{name}] 异常崩溃"));
-                        }
+            // AssertUnwindSafe：任务内部持有 Arc<Mutex>，panic 后我们不再依赖其一致性
+            // （panic 即视为任务终止，仅记录日志），因此跳过 UnwindSafe 约束。
+            let guarded = std::panic::AssertUnwindSafe(fut).catch_unwind();
+            if guarded.await.is_err() {
+                state
+                    .log(
+                        "batch",
+                        "error",
+                        format!("后台任务 [{name}] 异常崩溃（已停止）"),
+                    )
+                    .await;
+                // 让前端能看到异常：把运行中的账号标记为 error
+                let mut statuses = state.inner.statuses.lock().await;
+                for status in statuses.values_mut() {
+                    if status.running {
+                        status.status = "error".to_string();
+                        status.last_error = Some(format!("后台任务 [{name}] 异常崩溃"));
                     }
                 }
-                Err(_) => {}
             }
         })
     }
