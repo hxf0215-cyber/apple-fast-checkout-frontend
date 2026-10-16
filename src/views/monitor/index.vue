@@ -74,7 +74,10 @@ const settingsForm = reactive({
   proxyPoolLowWatermark: 5,
   proxyFetchConcurrency: 5,
   proxyCheckUrl: "https://www.apple.com.cn",
-  proxyPoolFormat: "line"
+  proxyPoolFormat: "line",
+  // watch 模式
+  watchIntervalMs: 800,
+  watchMaxRefresh: 0
 });
 
 const accounts = computed(() => state.value?.accounts || []);
@@ -174,6 +177,8 @@ function fillSettings() {
   settingsForm.proxyFetchConcurrency = settings.proxy_fetch_concurrency ?? 5;
   settingsForm.proxyCheckUrl = settings.proxy_check_url || "https://www.apple.com.cn";
   settingsForm.proxyPoolFormat = settings.proxy_pool_format || "line";
+  settingsForm.watchIntervalMs = settings.watch_interval_ms ?? 800;
+  settingsForm.watchMaxRefresh = settings.watch_max_refresh ?? 0;
 }
 
 async function loadProxyPoolStats() {
@@ -237,7 +242,9 @@ async function saveCentralMonitor() {
       proxy_pool_low_watermark: settingsForm.proxyPoolLowWatermark,
       proxy_fetch_concurrency: settingsForm.proxyFetchConcurrency,
       proxy_check_url: settingsForm.proxyCheckUrl.trim(),
-      proxy_pool_format: settingsForm.proxyPoolFormat
+      proxy_pool_format: settingsForm.proxyPoolFormat,
+      watch_interval_ms: settingsForm.watchIntervalMs,
+      watch_max_refresh: settingsForm.watchMaxRefresh
     };
     await api.saveSettings(payload);
     state.value.settings = payload;
@@ -903,6 +910,31 @@ watch(
             </div>
           </el-form-item>
         </template>
+
+        <el-divider content-position="left">watch 模式参数</el-divider>
+        <el-row :gutter="16">
+          <el-col :span="6">
+            <el-form-item label="刷新间隔(ms)">
+              <el-input-number
+                v-model="settingsForm.watchIntervalMs"
+                :min="200"
+                :step="200"
+                :max="60000"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="最大刷新次数">
+              <el-input-number
+                v-model="settingsForm.watchMaxRefresh"
+                :min="0"
+                :step="50"
+                :max="1000000"
+              />
+              <span class="form-hint" style="margin-left: 8px">0 = 不限次数</span>
+            </el-form-item>
+          </el-col>
+        </el-row>
       </el-form>
 
       <el-divider content-position="left">全局操作</el-divider>
