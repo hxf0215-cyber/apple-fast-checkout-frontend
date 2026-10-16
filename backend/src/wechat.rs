@@ -1253,55 +1253,6 @@ impl WeChatFlow {
         out
     }
 
-    /// 订单确认兜底：Apple 偶发在订单**实际已创建**的情况下返回
-    /// session_expired / 不完整响应（放置成功但轮询没拿到 thank you 页）。
-    /// 此时服务端会把购物袋清空，用「目标商品已不在购物袋」反证订单已创建，
-    /// 避免把成功误报为失败（实测：place_order 报 session_expired，
-    /// 但小程序订单列表里订单已存在，购物袋 count=0）。
-    async fn confirm_order_by_bag(&mut self) -> bool {
-        // Apple 清空购物袋是**异步**的：实测 place_order 返回 session_expired 后
-        // 立即查袋仍是 count=1，过一会儿才变 count=0，而订单确实已创建。
-        // 因此这里按递增间隔轮询，避免因查得太早把成功单判成失败。
-        const DELAYS_MS: [u64; 6] = [1_500, 2_500, 3_500, 4_500, 5_500, 7_000];
-        for (idx, delay_ms) in DELAYS_MS.iter().enumerate() {
-            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-            let Ok(bag) = self.bag().await else {
-                continue;
-            };
-            let empty = bag
-                .get("isEmptyCart")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let target_gone = !bag
-                .get("lineItems")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items.iter().any(|item| {
-                        item.get("partNumber").and_then(Value::as_str)
-                            == Some(self.part.as_str())
-                    })
-                })
-                .unwrap_or(false);
-            if empty || target_gone {
-                self.steps.push(json!({
-                    "name": "order_confirm_by_bag",
-                    "method": "GET",
-                    "url": BAG,
-                    "status": 200,
-                    "response_type": "application/json",
-                    "note": format!(
-                        "第 {} 次查袋：购物袋已清空（isEmptyCart={}）→ 判定订单已创建",
-                        idx + 1,
-                        empty
-                    ),
-                    "elapsed_ms": 0,
-                }));
-                return true;
-            }
-        }
-        false
-    }
-
     async fn place_order(&mut self) -> Result<Value> {
         let url = self
             .landing
@@ -1347,44 +1298,6 @@ impl WeChatFlow {
             .unwrap_or("")
             .to_string();
         if page_type != "thankyou" || order_number.is_empty() {
-            // 兜底：Apple 有时在订单已创建的情况下返回 session_expired /
-            // 不完整响应。此时购物袋会被**异步**清空——用「目标商品已不在袋中」反证成功。
-            // 注意：confirm_order_by_bag 内部自行记录 steps 与其轮询细节。
-            if self.confirm_order_by_bag().await {
-                // 尽力补全订单号：再拉一次 status 页，Apple 在返回 thank you 页时
-                // 会把 orderNumber 放在 /model/orderNumber。取不到不影响成功判定。
-                if let Some(status_url) = result
-                    .pointer("/head/data/url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                {
-                    if !status_url.is_empty() {
-                        if let Ok(status) = self
-                            .request_json("checkout_status", Method::GET, &status_url, None, true)
-                            .await
-                        {
-                            let recovered = status
-                                .pointer("/model/orderNumber")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            if !recovered.is_empty() {
-                                let mut confirmed = status.clone();
-                                if let Some(object) = confirmed.as_object_mut() {
-                                    object.insert("pageType".to_string(), json!("thankyou"));
-                                    object.insert("orderConfirmedByBag".to_string(), json!(true));
-                                }
-                                return Ok(confirmed);
-                            }
-                        }
-                    }
-                }
-                let mut confirmed = result.clone();
-                if let Some(object) = confirmed.as_object_mut() {
-                    object.insert("pageType".to_string(), json!("thankyou"));
-                    object.insert("orderConfirmedByBag".to_string(), json!(true));
-                }
-                return Ok(confirmed);
-            }
             let keys = result
                 .as_object()
                 .map(|object| object.keys().cloned().collect::<Vec<_>>())
