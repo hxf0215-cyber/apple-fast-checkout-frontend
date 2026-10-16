@@ -94,6 +94,21 @@ pub struct BatchCookieImport {
     pub contact: Option<ContactConfig>,
 }
 
+/// 从 Cookie 串里取出指定名称的 `name=value` 整段（含名称）。
+/// 例：`pick_cookie_value("as_dima=x; as_pvi=y", "as_dima")` → `"as_dima=x"`
+/// 找不到返回空字符串；名称两侧空白容错。
+fn pick_cookie_value(cookie_text: &str, name: &str) -> String {
+    for item in cookie_text.split(';') {
+        let item = item.trim();
+        if let Some((k, _)) = item.split_once('=') {
+            if k.trim() == name {
+                return item.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 fn parse_compact_account_line(
     line: &str,
     default_parts: &[String],
@@ -209,11 +224,12 @@ fn parse_compact_account_line(
         }
     };
     let remark = fields[json_index + 1..].join("----").trim().to_string();
-    let id = if remark.is_empty() {
-        username.clone()
-    } else {
-        remark
-    };
+    // 账号唯一标识必须用「邮箱」：备注只是给人看的标签，同一个人导入多行时
+    // 备注完全相同（例如都写「残枫」），若拿备注当 id 会导致后导入的行互相覆盖，
+    // 表现为「导入多行后只剩下同一个账号」。
+    // 同邮箱需要多套配置时，由导入层（api_import_accounts）追加 #N 序号保证唯一。
+    let _ = remark;
+    let id = username.clone();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1170,6 +1186,94 @@ impl AppState {
         if let Err(err) = save_order_records(&self.inner.orders_path, &orders_snapshot) {
             self.log("batch", "error", format!("订单历史保存失败：{err}"))
                 .await;
+        }
+
+        // 去重已通过 → 推送订单到外部接口。
+        // 放在 drop(orders) 之后，避免与 upload_order 内取 config 锁形成嵌套。
+        if !order_number.is_empty() {
+            self.upload_order(username, order_number, payment_link, part)
+                .await;
+        }
+    }
+
+    /// 把成交订单推送到外部接口（fire-and-forget，绝不影响下单主流程）。
+    ///
+    /// 触发点在 record_order：那是订单落库的唯一入口，6 处下单路径全部汇聚于此。
+    async fn upload_order(&self, username: &str, order_number: &str, url: &str, part: &str) {
+        let (upload_url, enabled, cookie_text) = {
+            let config = self.inner.config.lock().await;
+            let enabled = config.settings.order_upload_enabled
+                && !config.settings.order_upload_url.trim().is_empty();
+            // 以 account_id（= username）匹配账号取 wechat_cookie
+            let cookie = config
+                .accounts
+                .iter()
+                .find(|a| a.username == username || a.id == username)
+                .map(|a| a.wechat_cookie.clone())
+                .unwrap_or_default();
+            (
+                config.settings.order_upload_url.clone(),
+                enabled,
+                cookie,
+            )
+        };
+        if !enabled {
+            return;
+        }
+        let payload = json!({
+            "account": username,
+            "as_dima": pick_cookie_value(&cookie_text, "as_dima"),
+            "as_pvi": pick_cookie_value(&cookie_text, "as_pvi"),
+            "orderNumber": order_number,
+            "url": url,
+            "phoneId": part,
+        });
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                self.log(
+                    "batch",
+                    "error",
+                    format!("订单上传失败（构建客户端）：{err}"),
+                )
+                .await;
+                return;
+            }
+        };
+        match client.post(&upload_url).json(&payload).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if status == 200 {
+                    self.log(
+                        "batch",
+                        "info",
+                        format!("订单已上传：{order_number} → {upload_url}"),
+                    )
+                    .await;
+                } else {
+                    self.log(
+                        "batch",
+                        "error",
+                        format!(
+                            "订单上传失败（HTTP {status}）：{}",
+                            &body[..body.len().min(200)]
+                        ),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                self.log(
+                    "batch",
+                    "error",
+                    format!("订单上传失败（网络错误）：{err}"),
+                )
+                .await;
+            }
         }
     }
 
@@ -5215,20 +5319,33 @@ pub async fn api_wechat_warmup_batch(
                     } else {
                         vec![account.store_id.clone()]
                     };
-                    let mut candidates: Vec<(String, String)> = Vec::new();
+                    // 候选组合：有货的排前面（能一口气拿到结账页数据）。
+                    let mut in_stock: Vec<(String, String)> = Vec::new();
                     for part in &account_parts {
                         for store in &account_stores {
                             if warmup_available.contains(&(part.clone(), store.clone())) {
-                                candidates.push((part.clone(), store.clone()));
+                                in_stock.push((part.clone(), store.clone()));
                             }
                         }
                     }
-                    for part in &account_parts {
-                        for store in &account_stores {
-                            let key = (part.clone(), store.clone());
-                            if !candidates.contains(&key) {
-                                candidates.push(key);
+                    let mut candidates: Vec<(String, String)> = in_stock.clone();
+                    // 无货兜底：全都没货时随机挑一个组合做「预加购」；
+                    // 有货组合也放在末尾，作为「有货但预热失败」时的后备。
+                    // 目的：等库存到货时，若命中的正是预加购的型号，
+                    // 下单可直接走「bag 校验通过 → checkout_start」快路径。
+                    {
+                        let mut all: Vec<(String, String)> = Vec::new();
+                        for part in &account_parts {
+                            for store in &account_stores {
+                                let key = (part.clone(), store.clone());
+                                if !in_stock.contains(&key) {
+                                    all.push(key);
+                                }
                             }
+                        }
+                        if !all.is_empty() {
+                            let pick = rand::thread_rng().gen_range(0..all.len());
+                            candidates.push(all[pick].clone());
                         }
                     }
 
@@ -5263,14 +5380,14 @@ pub async fn api_wechat_warmup_batch(
                                 .pointer("/result/checkout_ready")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false);
+                            let pre_added = result
+                                .pointer("/result/pre_added")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
                             let session_key = format!("{}|{}", part, store);
                             warmup_state
                                 .persist_wechat_cookie_from_result(&account.id, &result)
                                 .await;
-                            if !cart_ready {
-                                last_error =
-                                    format!("{part}@{store} 无库存，仅完成购物袋清理与 OpenID 缓存");
-                            }
                             warmup_state
                                 .store_wechat_session(&account.id, session_key, result)
                                 .await;
@@ -5284,15 +5401,19 @@ pub async fn api_wechat_warmup_batch(
                                         store,
                                         if checkout_ready {
                                             "已进入结账页，下单可直接提交"
+                                        } else if pre_added {
+                                            "当前无货，目标商品已预加购（有货后直接结账，省去清空+加购+复检）"
                                         } else if cart_ready {
                                             "购物袋已就绪（未进入结账页，下单时补结账步骤）"
                                         } else {
-                                            "当前无货，仅完成购物袋清理与 OpenID 缓存（有货后下单少一步）"
+                                            "仅完成 OpenID 缓存"
                                         },
                                         display_proxy(&warmup_proxy)
                                     ),
                                 )
                                 .await;
+                            // 预加购也算成功：命中库存后能直接走快路径，
+                            // 因此不再继续尝试其它组合（每个账号只保留一个会话）。
                             done = cart_ready;
                         } else {
                             last_error = result
@@ -5631,25 +5752,52 @@ pub async fn api_import_accounts(
     if imported.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
+    // 同一邮箱出现多行时（id 相同会互相覆盖），给第 2 行起追加序号，
+    // 保证每行都能独立保留；「同邮箱重新导入」仍按基名覆盖旧配置。
+    {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for account in &mut imported {
+            let base = account.id.clone();
+            let count = seen.entry(base.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                account.id = format!("{base}#{count}");
+            }
+        }
+    }
+
+    // 按「邮箱基名」计算本次导入影响到的账号（含 email 与 email#N 全部变体）
+    let touched_bases = imported
+        .iter()
+        .map(|a| a.id.split('#').next().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+
     {
         let mut config = state.inner.config.lock().await;
-        let ids = imported.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
-        config.accounts.retain(|e| !ids.contains(&e.id));
+        config.accounts.retain(|e| {
+            !touched_bases
+                .iter()
+                .any(|b| b == e.id.split('#').next().unwrap_or(""))
+        });
         config.accounts.extend(imported.clone());
-    // 被覆盖的账号（同 ID 重新导入）必须清掉旧附属状态：
+    }
+
+    // 被覆盖的账号（同邮箱重新导入）必须清掉旧附属状态：
     // 旧会话内容可能与新配置（型号/门店）不匹配，代理绑定也已失效。
     {
+        let hit = |id: &str| {
+            touched_bases
+                .iter()
+                .any(|b| b == id.split('#').next().unwrap_or(""))
+        };
         let mut prepared = state.inner.prepared_wechat_orders.lock().await;
         let mut completed = state.inner.central_completed_accounts.lock().await;
         let mut assign = state.inner.account_proxy_assign.lock().await;
         let mut static_assign = state.inner.static_proxy_assign.lock().await;
-        for account in &imported {
-            prepared.remove(&account.id);
-            completed.remove(&account.id);
-            assign.remove(&account.id);
-            static_assign.remove(&account.id);
-        }
-    }
+        prepared.retain(|k, _| !hit(k));
+        completed.retain(|k| !hit(k));
+        assign.retain(|k, _| !hit(k));
+        static_assign.retain(|k, _| !hit(k));
     }
     let _ = state.persist_config().await;
     state.sync_statuses().await;
@@ -6741,5 +6889,39 @@ mod app_tests {
     fn do_not_retry_on_session_expired_403() {
         // 403 会话失效由「预会话回退全流程」分支处理，不应触发换 IP
         assert!(!is_proxy_retryable_order_error("save_time_slot failed with 403: "));
+    }
+
+    // --- 账号导入：id 必须是邮箱，备注重复不能互相覆盖 ---
+
+    #[test]
+    fn import_id_uses_email_not_remark() {
+        // 四行备注完全相同（残枫），但邮箱不同
+        let line = "a@x.com----as_dima=1; as_pvi=2----{\"phoneId\":[\"MK2N4CH/A\"],\"shopId\":[\"R476\"],\"email\":\"a@x.com\"}----残枫";
+        let parts = vec!["MK2N4CH/A".to_string()];
+        let stores = vec!["R476".to_string()];
+        let acc = parse_compact_account_line(line, &parts, &stores, "", "重庆", "重庆", "")
+            .expect("parse should not error")
+            .expect("should produce an account");
+        assert_eq!(acc.id, "a@x.com");
+        assert_eq!(acc.username, "a@x.com");
+    }
+
+    // --- 订单上传：Cookie 提取 ---
+
+    #[test]
+    fn pick_cookie_extracts_named_pair() {
+        let c = "as_dima=ee11b12; as_pvi=cc9e1; site=CHN";
+        assert_eq!(pick_cookie_value(c, "as_dima"), "as_dima=ee11b12");
+        assert_eq!(pick_cookie_value(c, "as_pvi"), "as_pvi=cc9e1");
+        assert_eq!(pick_cookie_value(c, "site"), "site=CHN");
+    }
+
+    #[test]
+    fn pick_cookie_handles_missing_and_spacing() {
+        let c = "as_dima = x1 ;  as_pvi=y2";
+        assert_eq!(pick_cookie_value(c, "as_dima"), "as_dima = x1");
+        assert_eq!(pick_cookie_value(c, "as_pvi"), "as_pvi=y2");
+        assert_eq!(pick_cookie_value(c, "nope"), "");
+        assert_eq!(pick_cookie_value("", "as_dima"), "");
     }
 }

@@ -158,6 +158,14 @@ pub struct GlobalSettings {
     /// 提取接口返回格式：line（每行一个）/ json（带 data 数组）
     #[serde(default = "default_proxy_pool_format")]
     pub proxy_pool_format: String,
+
+    // ===== 订单上传 =====
+    /// 订单成交后推送的外部接口地址（为空表示不推送）
+    #[serde(default = "default_order_upload_url")]
+    pub order_upload_url: String,
+    /// 订单上传总开关
+    #[serde(default = "default_order_upload_enabled")]
+    pub order_upload_enabled: bool,
 }
 
 impl Default for GlobalSettings {
@@ -196,6 +204,8 @@ impl Default for GlobalSettings {
             proxy_pool_fetch_proxy: String::new(),
             proxy_check_url: default_proxy_check_url(),
             proxy_pool_format: default_proxy_pool_format(),
+            order_upload_url: default_order_upload_url(),
+            order_upload_enabled: default_order_upload_enabled(),
         }
     }
 }
@@ -419,3 +429,10 @@ pub struct LogEntry {
 
 pub type CookieMap = HashMap<String, String>;
 
+fn default_order_upload_url() -> String {
+    "http://44.197.230.30:3434/api/order/upload".to_string()
+}
+
+fn default_order_upload_enabled() -> bool {
+    true
+}

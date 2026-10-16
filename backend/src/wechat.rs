@@ -1404,29 +1404,58 @@ impl WeChatFlow {
         // 注意：只做 checkout_start 是不够的——Apple 要求选店 / 时间段 / 联系人 /
         // 支付都完成后才接受 placeOrder，否则提交时返回 403。
         if self.prepare_cart().await.is_ok() && self.line_item_id.is_some() {
-            // 有货：完整预准备（到下单前一步）
-            let prepared = self.prepare().await?;
-            return Ok(json!({
-                "ok": true,
-                "warmup": true,
-                "cart_ready": true,
-                "checkout_ready": !self.spokes().is_empty(),
-                "openid_ready": self.openid.is_some(),
-                "proxy_url": self.proxy_url,
-                "part": self.part,
-                "store": self.store,
-                "line_item_id": self.line_item_id,
-                "cookies": self.cookies,
-                "stk": self.stk,
-                "openid": self.openid,
-                "landing": prepared.get("landing").cloned().unwrap_or(json!({})),
-                "session_id": self.session_id,
-                "model": self.model
-            }));
+            // 加购成功（商品已进袋）。接下来尝试走到「下单前一步」。
+            //  - 有货：能一路走到支付，产出可直接 place 的会话；
+            //  - 无货：会在选店/取货方式处被 Apple 拒绝，此时**不回滚购物车**，
+            //          降级为「预加购完成」，等监控到货后直接命中快路径。
+            match self.prepare().await {
+                Ok(prepared) => {
+                    return Ok(json!({
+                        "ok": true,
+                        "warmup": true,
+                        "cart_ready": true,
+                        "checkout_ready": !self.spokes().is_empty(),
+                        "openid_ready": self.openid.is_some(),
+                        "proxy_url": self.proxy_url,
+                        "part": self.part,
+                        "store": self.store,
+                        "line_item_id": self.line_item_id,
+                        "cookies": self.cookies,
+                        "stk": self.stk,
+                        "openid": self.openid,
+                        "landing": prepared.get("landing").cloned().unwrap_or(json!({})),
+                        "session_id": self.session_id,
+                        "model": self.model
+                    }));
+                }
+                Err(err) => {
+                    // 无货（或 Apple 拒绝继续结账）：购物车已保留目标商品 1×1，
+                    // 标记为「预加购就绪」，不计为失败。
+                    let openid_ready = self.fetch_openid().await.is_ok();
+                    return Ok(json!({
+                        "ok": true,
+                        "warmup": true,
+                        "cart_ready": true,
+                        "checkout_ready": false,
+                        "pre_added": true,
+                        "openid_ready": openid_ready,
+                        "pending_reason": err.to_string(),
+                        "proxy_url": self.proxy_url,
+                        "part": self.part,
+                        "store": self.store,
+                        "line_item_id": self.line_item_id,
+                        "cookies": self.cookies,
+                        "stk": self.stk,
+                        "openid": self.openid,
+                        "landing": self.landing,
+                        "session_id": self.session_id,
+                        "model": self.model
+                    }));
+                }
+            }
         }
 
-        // 无货：清空旧购物袋（保证有货时能干净加购）+ 缓存 OpenID
-        let cleared = self.clear_cart_only().await.is_ok();
+        // 连加购都没成功（清空/加购本身失败）：只缓存 OpenID
         let openid_ready = self.fetch_openid().await.is_ok();
         Ok(json!({
             "ok": true,
@@ -1434,7 +1463,6 @@ impl WeChatFlow {
             "cart_ready": false,
             "checkout_ready": false,
             "openid_ready": openid_ready,
-            "cart_cleared": cleared,
             "proxy_url": self.proxy_url,
             "part": self.part,
             "store": self.store,
