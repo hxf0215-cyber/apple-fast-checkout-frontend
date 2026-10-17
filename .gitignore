@@ -1,0 +1,28 @@
+﻿# ---- Rust 构建产物 ----
+target/
+**/*.rs.bk
+
+# ---- 运行时数据（含真实凭据，绝不能提交）----
+config.bin
+config.key
+config.json
+sessions.json
+orders.json
+cookies/
+logs/
+backups/
+__pycache__/
+*.pyc
+
+# ---- 本地环境 ----
+.cargo/
+.idea/
+.vscode/
+*.swp
+*.log
+
+# ---- 额外排除 ----
+static-proxies.json
+order-traces/
+*.exe
+*.old.exe
